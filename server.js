@@ -5,48 +5,47 @@ app.use(express.json());
 
 const LINE_ACCESS_TOKEN = "OPDo3K2o/qgIbbmefatWbzMOZhrA6i9a+HjqKeVKI0YmGCpoQzuwZKrTzWMziSEiEkP4GAoSuVyKW//dOTjVeAV0d8hEA1ZG+GRpdL4ixO1OY44RoovoxXC6F0D21ZgFQDXDCmOknnrTIrFK98Ba4gdB04t89/1O/w1cDnyilFU=";
 
+// Webhookエンドポイント
 app.post("/webhook", async (req, res) => {
-  const event = req.body.events?.[0];
-  if (!event) {
-    return res.status(200).send("No event");
-  }
+  const events = req.body.events;
 
-  const replyToken = event.replyToken;
+  // 複数イベントに対応（LINEの仕様）
+  for (const event of events) {
+    const replyToken = event.replyToken;
 
-  // ✅ 画像（写真）のときだけ応答する
-  if (event.message?.type === "image") {
-    try {
-      await axios.post(
-        "https://api.line.me/v2/bot/message/reply",
-        {
-          replyToken: replyToken,
-          messages: [
-            {
-              type: "text",
-              text: "📸 写真を受け取りました！診断を開始します🧠✨",
-            },
-          ],
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+    // ✅ 画像が送られた場合だけ返信
+    if (event.message && event.message.type === "image") {
+      try {
+        await axios.post(
+          "https://api.line.me/v2/bot/message/reply",
+          {
+            replyToken: replyToken,
+            messages: [
+              {
+                type: "text",
+                text: "📸 写真を受け取りました！診断を開始します🧠✨",
+              },
+            ],
           },
-        }
-      );
-
-      return res.status(200).send("Image reply sent");
-    } catch (err) {
-      console.error("Error replying to image:", err);
-      return res.status(500).send("Error");
+          {
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+            },
+          }
+        );
+      } catch (err) {
+        console.error("画像メッセージの返信失敗:", err);
+      }
     }
+
+    // ❌ 画像以外（テキスト等）は無視して返信しない
   }
 
-  // 💬 画像以外は応答しない（無視）
-  return res.status(200).send("Non-image message ignored");
+  res.status(200).send("OK");
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`✅ Server is running on port ${PORT}`);
 });
