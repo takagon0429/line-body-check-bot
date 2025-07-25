@@ -1,131 +1,88 @@
+require("dotenv").config();
 const express = require("express");
+const line = require("@line/bot-sdk");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
-const { execFile } = require("child_process");
-require("dotenv").config();
+const { v4: uuidv4 } = require("uuid");
 
 const app = express();
-app.use(express.json());
 
-const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
-
-// 画像保存関数
-const downloadImage = async (messageId, accessToken) => {
-  const url = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
-
-  const response = await axios.get(url, {
-    responseType: "arraybuffer",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-  });
-
-  const contentType = response.headers["content-type"];
-  const extension = contentType.split("/")[1];
-  const filename = `${messageId}.${extension}`;
-  const savePath = path.join(__dirname, "images", filename);
-
-  fs.writeFileSync(savePath, response.data);
-  console.log("✅ 画像を保存しました →", savePath);
-
-  return savePath;
+const config = {
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+  channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
+const client = new line.Client(config);
 
-// Webhook受信
-app.post("/webhook", async (req, res) => {
-  console.log("📩 Webhook受信内容:", JSON.stringify(req.body, null, 2));
-  const events = req.body.events;
+// 画像保存ディレクトリ
+const IMAGE_DIR = path.join(__dirname, "images");
+if (!fs.existsSync(IMAGE_DIR)) fs.mkdirSync(IMAGE_DIR);
 
-  for (const event of events) {
-    if (event.message && event.message.type === "image") {
-      const replyToken = event.replyToken;
-      const messageId = event.message.id;
-
-      try {
-        const imageDir = path.join(__dirname, "images");
-        if (!fs.existsSync(imageDir)) {
-          fs.mkdirSync(imageDir);
-        }
-
-        const imagePath = await downloadImage(messageId, LINE_ACCESS_TOKEN);
-
-        execFile("python3", ["analyze.py", imagePath], async (err, stdout, stderr) => {
-          if (err) {
-            console.error("❌ Pythonエラー:", err);
-            if (stderr) {
-              console.error("🐍 stderr:", stderr.toString());
-            }
-            return;
-          }
-
-          if (!stdout) {
-            console.error("❌ Pythonの出力が空です");
-            return;
-          }
-
-          try {
-            const result = JSON.parse(stdout.toString());
-            console.log("📊 診断結果:", result);
-
-            // エラーメッセージが含まれていたらそのまま返信
-            if (result.error) {
-              await axios.post("https://api.line.me/v2/bot/message/reply", {
-                replyToken,
-                messages: [{ type: "text", text: `⚠️ ${result.error}` }],
-              }, {
-                headers: {
-                  "Content-Type": "application/json",
-                  Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
-                },
-              });
-              return;
-            }
-
-            const replyText =
-              `📸 写真を受け取りました！
-
-■ 姿勢：${result["姿勢スコア"]} / 10
-${result["姿勢コメント"]}
-
-■ ボディバランス：${result["ボディバランススコア"]} / 10
-${result["バランスコメント"]}
-
-■ 筋肉・脂肪のつき方：${result["筋肉脂肪スコア"]} / 10
-${result["脂肪コメント"]}
-
-■ ファッション映え度：${result["ファッションスコア"]} / 10
-${result["ファッションコメント"]}
-
-■ 全体印象：${result["印象スコア"]} / 10
-${result["印象コメント"]}`;
-
-            await axios.post("https://api.line.me/v2/bot/message/reply", {
-              replyToken,
-              messages: [{ type: "text", text: replyText }],
-            }, {
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
-              },
-            });
-
-            console.log("✅ LINE返信完了");
-          } catch (parseErr) {
-            console.error("❌ JSONパースエラー:", parseErr);
-            console.error("📦 出力:", stdout.toString());
-          }
-        });
-      } catch (err) {
-        console.error("❌ 外部エラー:", err);
-      }
-    }
-  }
-
-  res.status(200).send("OK");
+app.post("/webhook", line.middleware(config), async (req, res) => {
+  Promise.all(req.body.events.map(handleEvent)).then(() => res.end());
 });
 
-// サーバー起動
+async function handleEvent(event) {
+  if (event.type !== "message" || event.message.type !== "image") {
+    return client.replyMessage(event.replyToken, {
+      type: "text",
+      text: "画像を送信してください📷",
+    });
+  }
+
+  // 画像を一時保存
+  const messageId = event.message.id;
+  const filename = `${uuidv4()}.jpg`;
+  const filepath = path.join(IMAGE_DIR, filename);
+  const stream = fs.createWriteStream(filepath);
+
+  try {
+    const streamData = await client.getMessageContent(messageId);
+    streamData.pipe(stream);
+
+    await new Promise((resolve, reject) => {
+      stream.on("finish", resolve);
+      stream.on("error", reject);
+    });
+
+    // ReplitのAPIに画像を送信
+    const formData = new FormData();
+    formData.append("image", fs.createReadStream(filepath));
+
+    const response = await axios.post(
+      "https://YOUR_REPLIT_URL.analyze.repl.co/analyze", // ← ReplitのURLに置き換え
+      formData,
+      { headers: formData.getHeaders() }
+    );
+
+    const result = response.data;
+
+    const message = formatResult(result);
+
+    return client.replyMessage(event.replyToken, {
+      type: "text",
+      text: message,
+    });
+  } catch (error) {
+    console.error("❌ エラー:", error);
+    return client.replyMessage(event.replyToken, {
+      type: "text",
+      text: "診断に失敗しました。画像が正しく読み込めませんでした。",
+    });
+  }
+}
+
+function formatResult(res) {
+  return (
+    `■ 姿勢：${res["姿勢スコア"]} / 10\n` +
+    `■ ボディバランス：${res["ボディバランススコア"]} / 10\n` +
+    `■ 筋肉・脂肪のつき方：${res["筋肉脂肪スコア"]} / 10\n` +
+    `■ ファッション映え度：${res["ファッション映えスコア"]} / 10\n` +
+    `■ 全体印象：${res["全体印象スコア"]} / 10\n\n` +
+    `✨改善アドバイス：姿勢を整えれば印象UP！`
+  );
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server is running on port ${PORT}`);
