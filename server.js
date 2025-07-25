@@ -3,15 +3,23 @@ const axios = require("axios");
 const app = express();
 app.use(express.json());
 
-const LINE_ACCESS_TOKEN = "OPDo3K2o/qgIbbmefatWbzMOZhrA6i9a+HjqKeVKI0YmGCpoQzuwZKrTzWMziSEiEkP4GAoSuVyKW//dOTjVeAV0d8hEA1ZG+GRpdL4ixO1OY44RoovoxXC6F0D21ZgFQDXDCmOknnrTIrFK98Ba4gdB04t89/1O/w1cDnyilFU=";
+const LINE_ACCESS_TOKEN = "＜あなたのアクセストークン＞";
 
 app.post("/webhook", async (req, res) => {
   const event = req.body.events?.[0];
-  if (!event || event.message?.type !== "image") {
-    return res.status(200).send("Not an image message");
+  if (!event) {
+    return res.status(200).send("No event");
   }
 
+  // 🔒 写真だったら何も返信しないで終了
+  if (event.message?.type === "image") {
+    console.log("📷 画像受信 → 応答なしで処理終了");
+    return res.status(200).send("Image received. No reply.");
+  }
+
+  // ✅ テキストなどには返信する（例）
   const replyToken = event.replyToken;
+  const userMessage = event.message?.text || "（メッセージ不明）";
 
   try {
     await axios.post(
@@ -21,7 +29,7 @@ app.post("/webhook", async (req, res) => {
         messages: [
           {
             type: "text",
-            text: "📸 写真を受け取りました！体型診断を開始します🧠（診断処理は後ほど実装）",
+            text: `あなたのメッセージ「${userMessage}」を受け取りました！`,
           },
         ],
       },
@@ -42,5 +50,5 @@ app.post("/webhook", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
