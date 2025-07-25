@@ -1,0 +1,13 @@
+{
+  "name": "line-body-check-bot",
+  "version": "1.0.0",
+  "description": "LINE Bot for body type diagnosis",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "express": "^4.18.2"
+  }
+}
