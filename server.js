@@ -2,6 +2,7 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const { execFile } = require("child_process");
 require("dotenv").config();
 
 const app = express();
@@ -9,7 +10,7 @@ app.use(express.json());
 
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 
-// 画像保存関数（拡張子付きで保存）
+// 🔽 画像保存関数（拡張子付きで保存）
 const downloadImage = async (messageId, accessToken) => {
   const url = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
 
@@ -31,9 +32,9 @@ const downloadImage = async (messageId, accessToken) => {
   return savePath;
 };
 
-// Webhookエンドポイント
+// 🔽 Webhookエンドポイント
 app.post("/webhook", async (req, res) => {
-  console.log("📩 Webhook受信内容:", JSON.stringify(req.body, null, 2)); // 👈 追加
+  console.log("📩 Webhook受信内容:", JSON.stringify(req.body, null, 2));
   const events = req.body.events;
 
   for (const event of events) {
@@ -42,39 +43,49 @@ app.post("/webhook", async (req, res) => {
       const messageId = event.message.id;
 
       try {
-        // 画像を保存
+        // フォルダがなければ作成
         const imageDir = path.join(__dirname, "images");
         if (!fs.existsSync(imageDir)) {
           fs.mkdirSync(imageDir);
         }
+
+        // 画像保存
         const imagePath = await downloadImage(messageId, LINE_ACCESS_TOKEN);
 
-        // LINEに返信
-        await axios.post(
-          "https://api.line.me/v2/bot/message/reply",
-          {
-            replyToken,
-            messages: [
-              {
-                type: "text",
-                text: "📸 写真を受け取りました！診断を開始します🧠✨",
-              },
-            ],
-          },
-          {
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
-            },
+        // Python分析実行
+        execFile("python3", ["analyze.py", imagePath], async (err, stdout, stderr) => {
+          if (err) {
+            console.error("❌ Pythonエラー:", err);
+            return;
           }
-        );
 
-        console.log("✅ LINE返信完了");
+          const result = JSON.parse(stdout.toString());
+          console.log("📊 診断結果:", result);
 
-        // （次のステップ）ここで analyze.py など診断処理を呼び出す想定
-        // const result = await runAnalyze(imagePath);
-        // await replyResult(replyToken, result);
+          // LINE返信（診断結果）
+          const replyText = `📸 写真を受け取りました！診断結果はこちら👇\n\n【姿勢】${result["姿勢"]}\n【重心】${result["重心"]}\n【印象】${result["印象"]}`;
 
+          await axios.post(
+            "https://api.line.me/v2/bot/message/reply",
+            {
+              replyToken,
+              messages: [
+                {
+                  type: "text",
+                  text: replyText,
+                },
+              ],
+            },
+            {
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+              },
+            }
+          );
+
+          console.log("✅ LINE返信完了");
+        });
       } catch (err) {
         console.error("❌ エラー:", err);
       }
@@ -84,7 +95,7 @@ app.post("/webhook", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// サーバー起動
+// 🔽 サーバー起動
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server is running on port ${PORT}`);
