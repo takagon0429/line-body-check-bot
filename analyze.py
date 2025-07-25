@@ -1,57 +1,42 @@
-import sys
-import json
 import mediapipe as mp
 import cv2
-import numpy as np
+import json
 
-def analyze_posture(image_path):
+def calculate_score(val, ideal, tolerance):
+    diff = abs(val - ideal)
+    score = max(0, 10 - (diff / tolerance) * 10)
+    return round(score, 1)
+
+def analyze_cat_posture(image_path):
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=True)
+
     image = cv2.imread(image_path)
-
-    if image is None:
-        return {"error": "画像が読み込めませんでした"}
-
-    # Mediapipeで処理
     results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    landmarks = results.pose_landmarks
 
-    if not results.pose_landmarks:
-        return {"error": "姿勢ランドマークが検出できませんでした"}
+    if not landmarks:
+        return {"error": "姿勢が検出できませんでした。全身が写っている画像を使用してください。"}
 
-    landmarks = results.pose_landmarks.landmark
+    lm = {mp_pose.PoseLandmark[k].name: landmarks.landmark[v.value]
+          for k, v in mp_pose.PoseLandmark.__members__.items()}
 
-    def get_coord(name):
-        return landmarks[mp_pose.PoseLandmark[name].value]
+    def y(name): return lm[name].y
 
-    # ✨ 猫背判定：肩と耳の位置から判断（肩より耳が前に出ていたら猫背気味）
-    shoulder = get_coord("LEFT_SHOULDER")
-    ear = get_coord("LEFT_EAR")
-    nekoze = abs(ear.x - shoulder.x) > 0.05  # 閾値は調整可
-    nekoze_result = "やや猫背" if nekoze else "良好"
+    shoulder_y = (y("LEFT_SHOULDER") + y("RIGHT_SHOULDER")) / 2
+    hip_y = (y("LEFT_HIP") + y("RIGHT_HIP")) / 2
+    posture_ratio = abs(shoulder_y - hip_y)
 
-    # ✨ 肥満傾向（簡易版）：腰と肩の幅を比較（胴体が広めなら肥満傾向）
-    l_shoulder = get_coord("LEFT_SHOULDER")
-    r_shoulder = get_coord("RIGHT_SHOULDER")
-    l_hip = get_coord("LEFT_HIP")
-    r_hip = get_coord("RIGHT_HIP")
+    score = calculate_score(posture_ratio, 0.25, 0.1)
 
-    shoulder_width = abs(r_shoulder.x - l_shoulder.x)
-    hip_width = abs(r_hip.x - l_hip.x)
-    hip_ratio = hip_width / shoulder_width if shoulder_width != 0 else 0
-    fat_result = "やや肥満傾向" if hip_ratio > 1.05 else "標準"
-
-    # ✨ 姿勢バランス：左右肩・腰の高さ差から傾きを推定
-    shoulder_diff = abs(r_shoulder.y - l_shoulder.y)
-    hip_diff = abs(r_hip.y - l_hip.y)
-    balance_result = "左右バランスにやや差あり" if shoulder_diff > 0.03 or hip_diff > 0.03 else "良好"
-
-    return {
-        "姿勢": nekoze_result,
-        "体型": fat_result,
-        "バランス": balance_result,
+    result = {
+        "姿勢（猫背傾向）スコア": score,
+        "肩-腰の比率": round(posture_ratio, 3)
     }
+    return result
 
 if __name__ == "__main__":
-    image_path = sys.argv[1]
-    result = analyze_posture(image_path)
-    print(json.dumps(result, ensure_ascii=False))
+    import sys
+    path = sys.argv[1]
+    res = analyze_cat_posture(path)
+    print(json.dumps(res, ensure_ascii=False))
