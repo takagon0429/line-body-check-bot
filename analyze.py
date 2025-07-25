@@ -1,6 +1,9 @@
+# analyze.py
+
 import mediapipe as mp
 import cv2
 import json
+import sys
 
 def calculate_score(val, ideal, tolerance):
     diff = abs(val - ideal)
@@ -12,13 +15,14 @@ def analyze_cat_posture(image_path):
     pose = mp_pose.Pose(static_image_mode=True)
 
     image = cv2.imread(image_path)
-    results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    landmarks = results.pose_landmarks
+    if image is None:
+        return {"error": "画像の読み込みに失敗しました"}
 
-    if not landmarks:
+    results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    if not results.pose_landmarks:
         return {"error": "姿勢が検出できませんでした。全身が写っている画像を使用してください。"}
 
-    lm = {mp_pose.PoseLandmark[k].name: landmarks.landmark[v.value]
+    lm = {mp_pose.PoseLandmark[k].name: results.pose_landmarks.landmark[v.value]
           for k, v in mp_pose.PoseLandmark.__members__.items()}
 
     def y(name): return lm[name].y
@@ -36,7 +40,7 @@ def analyze_cat_posture(image_path):
     return result
 
 if __name__ == "__main__":
-    import sys
+    print("🚀 Python started", flush=True)
     path = sys.argv[1]
     res = analyze_cat_posture(path)
     print(json.dumps(res, ensure_ascii=False))

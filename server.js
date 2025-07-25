@@ -1,4 +1,5 @@
-// 必要なモジュール読み込み
+// server.js
+
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
@@ -11,7 +12,7 @@ app.use(express.json());
 
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 
-// 🔽 画像保存関数（拡張子付きで保存）
+// 画像保存関数
 const downloadImage = async (messageId, accessToken) => {
   const url = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
 
@@ -22,8 +23,8 @@ const downloadImage = async (messageId, accessToken) => {
     },
   });
 
-  const contentType = response.headers["content-type"]; // 例: image/jpeg
-  const extension = contentType.split("/")[1]; // jpeg / png など
+  const contentType = response.headers["content-type"];
+  const extension = contentType.split("/")[1];
   const filename = `${messageId}.${extension}`;
   const savePath = path.join(__dirname, "images", filename);
 
@@ -33,31 +34,35 @@ const downloadImage = async (messageId, accessToken) => {
   return savePath;
 };
 
-// 🔽 Webhookエンドポイント
+// Webhook受信
 app.post("/webhook", async (req, res) => {
   console.log("📩 Webhook受信内容:", JSON.stringify(req.body, null, 2));
   const events = req.body.events;
 
   for (const event of events) {
-    // 画像メッセージの場合のみ処理
     if (event.message && event.message.type === "image") {
       const replyToken = event.replyToken;
       const messageId = event.message.id;
 
       try {
-        // imagesフォルダがなければ作成
         const imageDir = path.join(__dirname, "images");
         if (!fs.existsSync(imageDir)) {
           fs.mkdirSync(imageDir);
         }
 
-        // 画像を保存
         const imagePath = await downloadImage(messageId, LINE_ACCESS_TOKEN);
 
-        // analyze.py をPythonで実行
         execFile("python3", ["analyze.py", imagePath], async (err, stdout, stderr) => {
           if (err) {
             console.error("❌ Pythonエラー:", err);
+            if (stderr) {
+              console.error("🐍 stderr:", stderr.toString());
+            }
+            return;
+          }
+
+          if (!stdout) {
+            console.error("❌ Pythonの出力が空です");
             return;
           }
 
@@ -65,23 +70,30 @@ app.post("/webhook", async (req, res) => {
             const result = JSON.parse(stdout.toString());
             console.log("📊 診断結果:", result);
 
-            // LINE返信文の作成
-            const replyText = `📸 写真を受け取りました！診断結果はこちら👇\n\n` +
-              `【姿勢】${result["姿勢"]}\n` +
-              `【重心】${result["重心"]}\n` +
-              `【印象】${result["印象"]}`;
+            if (result.error) {
+              await axios.post(
+                "https://api.line.me/v2/bot/message/reply",
+                {
+                  replyToken,
+                  messages: [{ type: "text", text: `⚠️ ${result.error}` }],
+                },
+                {
+                  headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+                  },
+                }
+              );
+              return;
+            }
 
-            // LINEへ返信
+            const replyText = `📸 写真を受け取りました！\n\n【姿勢スコア】${result["姿勢（猫背傾向）スコア"]} / 10\n肩-腰の比率: ${result["肩-腰の比率"]}`;
+
             await axios.post(
               "https://api.line.me/v2/bot/message/reply",
               {
                 replyToken,
-                messages: [
-                  {
-                    type: "text",
-                    text: replyText,
-                  },
-                ],
+                messages: [{ type: "text", text: replyText }],
               },
               {
                 headers: {
@@ -92,12 +104,13 @@ app.post("/webhook", async (req, res) => {
             );
 
             console.log("✅ LINE返信完了");
-          } catch (parseError) {
-            console.error("❌ JSON解析エラー:", parseError);
+          } catch (parseErr) {
+            console.error("❌ JSONパースエラー:", parseErr);
+            console.error("📦 出力:", stdout.toString());
           }
         });
       } catch (err) {
-        console.error("❌ 処理中のエラー:", err);
+        console.error("❌ 外部エラー:", err);
       }
     }
   }
@@ -105,7 +118,7 @@ app.post("/webhook", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// 🔽 サーバー起動
+// サーバー起動
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server is running on port ${PORT}`);
