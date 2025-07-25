@@ -11,41 +11,39 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).send("No event");
   }
 
-  // 🔒 写真だったら何も返信しないで終了
-  if (event.message?.type === "image") {
-    console.log("📷 画像受信 → 応答なしで処理終了");
-    return res.status(200).send("Image received. No reply.");
-  }
-
-  // ✅ テキストなどには返信する（例）
   const replyToken = event.replyToken;
-  const userMessage = event.message?.text || "（メッセージ不明）";
 
-  try {
-    await axios.post(
-      "https://api.line.me/v2/bot/message/reply",
-      {
-        replyToken: replyToken,
-        messages: [
-          {
-            type: "text",
-            text: `あなたのメッセージ「${userMessage}」を受け取りました！`,
-          },
-        ],
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+  // ✅ 画像（写真）のときだけ応答する
+  if (event.message?.type === "image") {
+    try {
+      await axios.post(
+        "https://api.line.me/v2/bot/message/reply",
+        {
+          replyToken: replyToken,
+          messages: [
+            {
+              type: "text",
+              text: "📸 写真を受け取りました！診断を開始します🧠✨",
+            },
+          ],
         },
-      }
-    );
+        {
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+          },
+        }
+      );
 
-    res.status(200).send("Success");
-  } catch (err) {
-    console.error("Error replying:", err);
-    res.status(500).send("Error");
+      return res.status(200).send("Image reply sent");
+    } catch (err) {
+      console.error("Error replying to image:", err);
+      return res.status(500).send("Error");
+    }
   }
+
+  // 💬 画像以外は応答しない（無視）
+  return res.status(200).send("Non-image message ignored");
 });
 
 const PORT = process.env.PORT || 3000;
