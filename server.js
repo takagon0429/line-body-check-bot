@@ -1,3 +1,4 @@
+// 必要なモジュール読み込み
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
@@ -21,8 +22,8 @@ const downloadImage = async (messageId, accessToken) => {
     },
   });
 
-  const contentType = response.headers["content-type"]; // e.g. "image/jpeg"
-  const extension = contentType.split("/")[1]; // jpeg / png
+  const contentType = response.headers["content-type"]; // 例: image/jpeg
+  const extension = contentType.split("/")[1]; // jpeg / png など
   const filename = `${messageId}.${extension}`;
   const savePath = path.join(__dirname, "images", filename);
 
@@ -38,56 +39,65 @@ app.post("/webhook", async (req, res) => {
   const events = req.body.events;
 
   for (const event of events) {
+    // 画像メッセージの場合のみ処理
     if (event.message && event.message.type === "image") {
       const replyToken = event.replyToken;
       const messageId = event.message.id;
 
       try {
-        // フォルダがなければ作成
+        // imagesフォルダがなければ作成
         const imageDir = path.join(__dirname, "images");
         if (!fs.existsSync(imageDir)) {
           fs.mkdirSync(imageDir);
         }
 
-        // 画像保存
+        // 画像を保存
         const imagePath = await downloadImage(messageId, LINE_ACCESS_TOKEN);
 
-        // Python分析実行
+        // analyze.py をPythonで実行
         execFile("python3", ["analyze.py", imagePath], async (err, stdout, stderr) => {
           if (err) {
             console.error("❌ Pythonエラー:", err);
             return;
           }
 
-          const result = JSON.parse(stdout.toString());
-          console.log("📊 診断結果:", result);
+          try {
+            const result = JSON.parse(stdout.toString());
+            console.log("📊 診断結果:", result);
 
-          // LINE返信（診断結果）
-          const replyText = `📸 写真を受け取りました！診断結果はこちら👇\n\n【姿勢】${result["姿勢"]}\n【重心】${result["重心"]}\n【印象】${result["印象"]}`;
+            // LINE返信文の作成
+            const replyText = `📸 写真を受け取りました！診断結果はこちら👇\n\n` +
+              `【姿勢】${result["姿勢"]}\n` +
+              `【重心】${result["重心"]}\n` +
+              `【印象】${result["印象"]}`;
 
-          await axios.post(
-            "https://api.line.me/v2/bot/message/reply",
-            {
-              replyToken,
-              messages: [
-                {
-                  type: "text",
-                  text: replyText,
-                },
-              ],
-            },
-            {
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+            // LINEへ返信
+            await axios.post(
+              "https://api.line.me/v2/bot/message/reply",
+              {
+                replyToken,
+                messages: [
+                  {
+                    type: "text",
+                    text: replyText,
+                  },
+                ],
               },
-            }
-          );
+              {
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+                },
+              }
+            );
 
-          console.log("✅ LINE返信完了");
+            console.log("✅ LINE返信完了");
+          } catch (parseError) {
+            console.error("❌ JSON解析エラー:", parseError);
+          }
         });
       } catch (err) {
-        console.error("❌ エラー:", err);
+        console.error("❌ 処理中のエラー:", err);
       }
     }
   }
