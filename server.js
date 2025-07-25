@@ -1,5 +1,3 @@
-// server.js
-
 const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
@@ -70,38 +68,47 @@ app.post("/webhook", async (req, res) => {
             const result = JSON.parse(stdout.toString());
             console.log("📊 診断結果:", result);
 
+            // エラーメッセージが含まれていたらそのまま返信
             if (result.error) {
-              await axios.post(
-                "https://api.line.me/v2/bot/message/reply",
-                {
-                  replyToken,
-                  messages: [{ type: "text", text: `⚠️ ${result.error}` }],
-                },
-                {
-                  headers: {
-                    "Content-Type": "application/json",
-                    Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
-                  },
-                }
-              );
-              return;
-            }
-
-            const replyText = `📸 写真を受け取りました！\n\n【姿勢スコア】${result["姿勢（猫背傾向）スコア"]} / 10\n肩-腰の比率: ${result["肩-腰の比率"]}`;
-
-            await axios.post(
-              "https://api.line.me/v2/bot/message/reply",
-              {
+              await axios.post("https://api.line.me/v2/bot/message/reply", {
                 replyToken,
-                messages: [{ type: "text", text: replyText }],
-              },
-              {
+                messages: [{ type: "text", text: `⚠️ ${result.error}` }],
+              }, {
                 headers: {
                   "Content-Type": "application/json",
                   Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
                 },
-              }
-            );
+              });
+              return;
+            }
+
+            const replyText =
+              `📸 写真を受け取りました！
+
+■ 姿勢：${result["姿勢スコア"]} / 10
+${result["姿勢コメント"]}
+
+■ ボディバランス：${result["ボディバランススコア"]} / 10
+${result["バランスコメント"]}
+
+■ 筋肉・脂肪のつき方：${result["筋肉脂肪スコア"]} / 10
+${result["脂肪コメント"]}
+
+■ ファッション映え度：${result["ファッションスコア"]} / 10
+${result["ファッションコメント"]}
+
+■ 全体印象：${result["印象スコア"]} / 10
+${result["印象コメント"]}`;
+
+            await axios.post("https://api.line.me/v2/bot/message/reply", {
+              replyToken,
+              messages: [{ type: "text", text: replyText }],
+            }, {
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${LINE_ACCESS_TOKEN}`,
+              },
+            });
 
             console.log("✅ LINE返信完了");
           } catch (parseErr) {
