@@ -1,7 +1,3 @@
-cd ~/Desktop/line-body-check-bot
-
-cat > app.py <<'PY'
-import os
 from flask import Flask, request, abort
 
 # ==== LINE v3 SDK ====
