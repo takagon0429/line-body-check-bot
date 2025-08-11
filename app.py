@@ -11,12 +11,13 @@ from linebot.v3.webhooks import (
 )
 from linebot.v3.messaging import (
     Configuration,
+    ApiClient,          # ← これを使う
     MessagingApi,
     ReplyMessageRequest,
     TextMessage,
 )
 
-# ===== 環境変数の読み込み =====
+# ===== 環境変数 =====
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 
@@ -28,15 +29,18 @@ app = Flask(__name__)
 
 # ===== LINE SDK 準備 =====
 handler = WebhookHandler(CHANNEL_SECRET)
+
+# ApiClient を 1回だけ作って使い回す
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-api = MessagingApi(configuration)
+api_client = ApiClient(configuration)
+messaging_api = MessagingApi(api_client)
 
 # ===== ヘルスチェック =====
 @app.get("/")
 def index():
     return jsonify({"status": "ok", "service": "line-body-check-bot"})
 
-# ===== LINE の Webhook 受け口 =====
+# ===== Webhook 入口 =====
 @app.post("/callback")
 def callback():
     signature = request.headers.get("X-Line-Signature")
@@ -48,18 +52,17 @@ def callback():
     try:
         handler.handle(body, signature)
     except Exception as e:
-        # 何かあれば 200 で返しつつログ
         app.logger.exception(f"/callback handle error: {e}")
+        # LINE 側へは 200 を返して再試行を避ける
         return "OK", 200
 
     return "OK", 200
 
-# ====== メッセージハンドラ ======
+# ===== メッセージハンドラ =====
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_text_message(event: MessageEvent):
-    """テキストが来たら固定返信"""
     try:
-        api.reply_message(
+        messaging_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text="受け取りました ✅")]
@@ -70,9 +73,8 @@ def on_text_message(event: MessageEvent):
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def on_image_message(event: MessageEvent):
-    """画像が来たら固定返信（まずは動作確認用）"""
     try:
-        api.reply_message(
+        messaging_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text="画像を受け取りました。正面と横の2枚を続けて送ってください。")]
