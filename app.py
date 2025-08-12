@@ -1,69 +1,57 @@
-# app.py — LINE Bot (v3 SDK) 完全版
 import os
-import logging
-from flask import Flask, request
-
-# LINE v3 SDK
-from linebot.v3.webhook import WebhookHandler, MessageEvent, TextMessageContent
+from flask import Flask, request, abort
+from linebot.v3.webhook import WebhookHandler            # singular
+from linebot.v3.webhooks import MessageEvent, TextMessageContent  # plural
 from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi,
+    ApiClient, Configuration, MessagingApi, ReplyMessageRequest, TextMessage
 )
-from linebot.v3.messaging.models import (
-    ReplyMessageRequest, TextMessage,
-)
+from linebot.v3.exceptions import InvalidSignatureError
 
-# --- 基本設定 ---
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-logger = app.logger
 
-CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+# 環境変数から取得（Renderの環境変数設定で登録）
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
-if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise RuntimeError("LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN をRenderの環境変数に設定してください。")
+if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
+    raise ValueError("環境変数 LINE_CHANNEL_ACCESS_TOKEN と LINE_CHANNEL_SECRET を設定してください")
 
-# LINE クライアント
 handler = WebhookHandler(CHANNEL_SECRET)
-config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-api_client = ApiClient(config)
-messaging_api = MessagingApi(api_client)
 
-# --- ヘルスチェック ---
-@app.get("/")
+@app.route("/", methods=["GET"])
 def index():
-    return "OK", 200
+    return "LINE Bot is running!", 200
 
-# --- Webhook 受信口 ---
-@app.post("/callback")
+@app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)  # ← bytes ではなく str で取得
+    body = request.get_data(as_text=True)
+
     try:
         handler.handle(body, signature)
-        return "OK", 200
-    except Exception as e:
-        logger.error(f"callback handle error: {e!r}")
-        return "NG", 400
+    except InvalidSignatureError:
+        abort(400)
 
-# --- イベントハンドラ（テキスト受信）---
+    return "OK", 200
+
 @handler.add(MessageEvent, message=TextMessageContent)
-def on_text_message(event: MessageEvent):
-    user_text = event.message.text or ""
-    try:
+def handle_text_message(event):
+    """テキストメッセージを受信して返信する"""
+    user_text = event.message.text.strip() if event.message and hasattr(event.message, "text") else ""
+    reply_token = event.reply_token
+
+    cfg = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+    with ApiClient(cfg) as api_client:
+        messaging_api = MessagingApi(api_client)
         messaging_api.reply_message(
             ReplyMessageRequest(
-                reply_token=event.reply_token,
+                replyToken=reply_token,
                 messages=[
-                    TextMessage(text=f"受け取りました！: {user_text}")
-                ],
+                    TextMessage(text=f"受け取りました：{user_text}")
+                ]
             )
         )
-    except Exception as e:
-        logger.error("reply text error: %s", e)
 
-# --- ローカル起動用（Renderでは不要）---
 if __name__ == "__main__":
-    # Render は PORT 環境変数を渡してくることが多いので対応
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
