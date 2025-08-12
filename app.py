@@ -211,7 +211,8 @@ def analyze_and_push(user_id: str, front_path: str, side_path: str):
         text = "診断API呼び出しでエラーが発生しました。（HTTP）\n時間をおいて再度お試しください。」
     except Exception as e:
         log.error(f"analyzer post error: {e}", exc_info=True)
-        text = "診断API呼び出しでエラーが発生しました。時間をおいて再度お試しください。"
+        text = "診断API呼び出しでエラーが発生しました。（HTTP）\n時間をおいて再度お試しください。"
+
     finally:
         # 結果を push（replyTokenは使わない）
         push_text(user_id, text)
