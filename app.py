@@ -14,11 +14,11 @@ from flask import Flask, request, abort
 # === LINE SDK v3 ===
 from linebot.v3.webhook import WebhookHandler
 from linebot.v3.webhooks import (
-    WebhookHandler,
     MessageEvent,
     TextMessageContent,
     ImageMessageContent,
 )
+
 from linebot.v3.messaging import (
     Configuration,
     ApiClient,
