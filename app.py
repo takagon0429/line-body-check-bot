@@ -1,202 +1,169 @@
-# app.py — LINE Bot (v3) that collects 2 photos (front/side), calls Analyzer, and replies the result.
-
 import os
-import json
 import tempfile
+import time
 import logging
 from typing import Dict, Optional
 
 import requests
-from flask import Flask, request, abort, jsonify
+from flask import Flask, request, abort
 
-# LINE SDK v3
-from linebot.v3.webhook import WebhookHandler
-from linebot.v3.webhooks import (
-    MessageEvent,
-    TextMessageContent,
-    ImageMessageContent,
-)
+# ==== LINE SDK v3 ====
+from linebot.v3 import WebhookParser
+from linebot.v3.webhook import WebhookHandler  # シグネチャ検証＆ディスパッチ
 from linebot.v3.messaging import (
-    MessagingApi,
-    ApiClient,
-    Configuration,
+    Configuration, ApiClient,
+    MessagingApi, MessagingApiBlob,
+    ReplyMessageRequest, TextMessage,
 )
-from linebot.v3.messaging.models import (
-    ReplyMessageRequest,
-    TextMessage,
+from linebot.v3.webhooks import (
+    MessageEvent, TextMessageContent, ImageMessageContent,
 )
 
-# ------------------------------------------------------------------------------
-# Settings
-# ------------------------------------------------------------------------------
-
+# -----------------------------
+# 環境変数
+# -----------------------------
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-
-# Analyzer のエンドポイント（Render の Analyzer サービスを指定）
-ANALYZER_URL = os.getenv(
-    "ANALYZER_URL",
-    "https://ai-body-check-analyzer.onrender.com/analyze",
-)
+ANALYZER_URL = os.getenv("ANALYZER_URL", "https://ai-body-check-analyzer.onrender.com/analyze")
 
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise RuntimeError("LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN を環境変数に設定してください。")
+    raise RuntimeError("LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN を設定してください。")
 
+# -----------------------------
 # Flask
+# -----------------------------
 app = Flask(__name__)
-
-# Logging（Render のログに出る）
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("line-bot")
 
-# LINE clients (v3)
-config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-api_client = ApiClient(config)
+# -----------------------------
+# LINE クライアント
+# -----------------------------
+configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+api_client = ApiClient(configuration)
 messaging_api = MessagingApi(api_client)
+blob_api = MessagingApiBlob(api_client)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# ------------------------------------------------------------------------------
-# Simple health route
-# ------------------------------------------------------------------------------
-@app.get("/")
-def index():
-    return jsonify({"ok": True, "service": "line-body-check-bot", "analyzer": ANALYZER_URL}), 200
+# -----------------------------
+# ユーザーごとの一時状態（メモリ）
+#   user_id -> {"front": "/tmp/xxx.jpg", "ts": 172...}
+# -----------------------------
+user_state: Dict[str, Dict[str, str]] = {}
+IMAGE_TIMEOUT_SEC = 15 * 60  # 15分で破棄
 
-# ------------------------------------------------------------------------------
-# In-memory session to collect 2 images per user
-#  user_id -> {"front": "/tmp/xxx.jpg" or None, "side": "/tmp/yyy.jpg" or None}
-# ------------------------------------------------------------------------------
-SESSIONS: Dict[str, Dict[str, Optional[str]]] = {}
+# -----------------------------
+# ユーティリティ
+# -----------------------------
+def reply_text(reply_token: str, text: str) -> None:
+    """テキスト返信（v3）"""
+    try:
+        messaging_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=text)]
+            )
+        )
+    except Exception as e:
+        logger.error("reply text error: %s", e)
 
-def ensure_session(user_id: str) -> Dict[str, Optional[str]]:
-    sess = SESSIONS.get(user_id)
-    if sess is None:
-        sess = {"front": None, "side": None}
-        SESSIONS[user_id] = sess
-    return sess
-
-def reset_session(user_id: str):
-    sess = SESSIONS.get(user_id)
-    if not sess:
+def cleanup_user(user_id: str) -> None:
+    """ユーザーの一時計測状態＆ファイル片付け"""
+    st = user_state.pop(user_id, None)
+    if not st:
         return
-    # ファイル掃除
-    for k in ("front", "side"):
-        p = sess.get(k)
+    for key in ("front", "side"):
+        p = st.get(key)
         if p and os.path.exists(p):
             try:
                 os.remove(p)
             except Exception:
                 pass
-    SESSIONS[user_id] = {"front": None, "side": None}
-
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-
-def reply_text(reply_token: str, text: str):
-    try:
-        messaging_api.reply_message(
-            ReplyMessageRequest(
-                replyToken=reply_token,
-                messages=[TextMessage(text=text)],
-            )
-        )
-    except Exception as e:
-        # エラー内容をログへ
-        logger.error("reply_text error: %s", e, exc_info=True)
 
 def download_line_image_to_temp(message_id: str) -> str:
     """
-    LINEサーバーから画像を取得して、一時ファイルへ保存してパスを返す。
-    v3 SDKは get_message_content が bytes を返す実装。
-    環境差に備えて bytes 以外のレスポンスもケア。
+    LINEの画像を一時ファイルに保存してパスを返す。
+    SDK v3では MessagingApiBlob.get_message_content を使う。
     """
-    resp = messaging_api.get_message_content(message_id)
-
-    # tempfile へ保存
-    f = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-    path = f.name
-
-    try:
-        if isinstance(resp, (bytes, bytearray)):
-            f.write(resp)
-        else:
-            # 念のため file-like も対応
-            if hasattr(resp, "read"):
-                f.write(resp.read())
-            elif hasattr(resp, "data"):
-                f.write(resp.data)  # 一部のHTTPResponse互換
-            else:
-                # 不明な型でも to bytes を試みる
-                f.write(bytes(resp))
-    finally:
-        f.close()
+    content_bytes: bytes = blob_api.get_message_content(message_id)  # ← v3はこれ
+    fd, path = tempfile.mkstemp(prefix="lineimg_", suffix=".jpg")
+    os.close(fd)
+    with open(path, "wb") as f:
+        f.write(content_bytes)
     return path
 
-def call_analyzer(front_path: str, side_path: str) -> dict:
-    with open(front_path, "rb") as f1, open(side_path, "rb") as f2:
-        files = {
-            "front": ("front.jpg", f1, "image/jpeg"),
-            "side": ("side.jpg", f2, "image/jpeg"),
-        }
-        r = requests.post(ANALYZER_URL, files=files, timeout=60)
+def post_to_analyzer(front_path: str, side_path: str) -> Optional[dict]:
+    """Analyzer の /analyze に2枚送信して結果JSONを返す。失敗時は None"""
+    try:
+        with open(front_path, "rb") as ff, open(side_path, "rb") as sf:
+            files = {
+                "front": ("front.jpg", ff, "image/jpeg"),
+                "side": ("side.jpg", sf, "image/jpeg"),
+            }
+            r = requests.post(ANALYZER_URL, files=files, timeout=60)
         r.raise_for_status()
         return r.json()
+    except Exception as e:
+        logger.error("analyzer post error: %s", e)
+        return None
 
-def format_analysis_result(res: dict) -> str:
-    """
-    Analyzer からの JSON をLINE向けのテキストに整形。
-    期待JSON（例）:
-      {
-        "scores": {"overall": 8.8, "posture": 9.8, "balance": 7.3, "muscle_fat": 9.8, "fashion": 8.8},
-        "advice": ["～しましょう", "..."],
-        "front_metrics": {...},
-        "side_metrics": {...}
-      }
-    """
-    scores = res.get("scores", {})
-    advice = res.get("advice", [])
-    fm = res.get("front_metrics", {})
-    sm = res.get("side_metrics", {})
+def build_report_text(result: dict) -> str:
+    """AnalyzerのJSONを読みやすいテキストに整形"""
+    scores = result.get("scores", {})
+    front = result.get("front_metrics", {})
+    side = result.get("side_metrics", {})
+    advice_list = result.get("advice", [])
 
     lines = []
-    lines.append("📊 解析結果")
     if scores:
-        def g(k):  # 取り出し時は小数点1桁に
-            v = scores.get(k)
-            return f"{float(v):.1f}" if isinstance(v, (int, float)) else "-"
+        lines.append("【総合スコア】")
+        lines.append(
+            f"  総合: {scores.get('overall','-')}"
+            f" / 姿勢: {scores.get('posture','-')}"
+            f" / バランス: {scores.get('balance','-')}"
+            f" / 筋肉・脂肪: {scores.get('muscle_fat','-')}"
+            f" / ファッション: {scores.get('fashion','-')}"
+        )
+    if front:
+        lines.append("【正面の指標】")
+        lines.append(
+            f"  肩の高さ差: {front.get('shoulder_delta_y','-')} px, "
+            f"骨盤の高さ差: {front.get('pelvis_delta_y','-')} px, "
+            f"膝/足首バランス: {front.get('knee_ankle_ratio','-'):.3f}"
+            if isinstance(front.get('knee_ankle_ratio'), (int, float))
+            else f"  肩の高さ差: {front.get('shoulder_delta_y','-')} px, "
+                 f"骨盤の高さ差: {front.get('pelvis_delta_y','-')} px, "
+                 f"膝/足首バランス: -"
+        )
+    if side:
+        lines.append("【側面の指標】")
+        lines.append(
+            f"  頭部前方変位: {side.get('forward_head','-')} px, "
+            f"体幹角度: {side.get('trunk_angle','-')}°, "
+            f"骨盤角度: {side.get('pelvic_angle','-')}°"
+        )
+    if advice_list:
+        lines.append("【アドバイス】")
+        for a in advice_list:
+            lines.append(f"  - {a}")
 
-        lines.append(f"- 総合: {g('overall')}")
-        lines.append(f"- 姿勢: {g('posture')} / バランス: {g('balance')}")
-        lines.append(f"- 筋肉・脂肪: {g('muscle_fat')} / ファッション: {g('fashion')}")
-
-    # 簡単にメトリクスの一部も表示
-    if fm or sm:
-        lines.append("")
-        lines.append("🔎 指標（抜粋）")
-        if 'shoulder_delta_y' in fm:
-            lines.append(f"- 肩の左右差: {fm.get('shoulder_delta_y')}")
-        if 'pelvis_delta_y' in fm:
-            lines.append(f"- 骨盤の左右差: {fm.get('pelvis_delta_y')}")
-        if 'trunk_angle' in sm:
-            lines.append(f"- 体幹角度: {sm.get('trunk_angle')}")
-        if 'forward_head' in sm:
-            lines.append(f"- 頭部前方: {sm.get('forward_head')}")
-
-    if advice:
-        lines.append("")
-        lines.append("💡 アドバイス")
-        for a in advice[:3]:
-            lines.append(f"- {a}")
-
-    lines.append("")
-    lines.append("※ 本結果は参考値です。撮影条件（姿勢・距離・明るさ）で変動します。")
-
+    if not lines:
+        return "診断結果の解析に失敗しました。時間をおいて再度お試しください。"
     return "\n".join(lines)
 
-# ------------------------------------------------------------------------------
-# Webhook
-# ------------------------------------------------------------------------------
+def is_timeout(ts: float) -> bool:
+    return (time.time() - ts) > IMAGE_TIMEOUT_SEC
+
+# -----------------------------
+# ルート
+# -----------------------------
+@app.get("/")
+def index():
+    return "LINE Bot is running.", 200
+
+# -----------------------------
+# Webhook 受信
+# -----------------------------
 @app.post("/callback")
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -205,84 +172,80 @@ def callback():
     try:
         handler.handle(body, signature)
     except Exception as e:
-        logger.error("callback handle error: %s", e, exc_info=True)
-        return "NG", 400
+        logger.error("callback handle error: %r", e)
+        return "bad request", 400
     return "OK", 200
 
-# ------------------------------------------------------------------------------
-# Event Handlers
-# ------------------------------------------------------------------------------
+# -----------------------------
+# イベントハンドラ（テキスト）
+# -----------------------------
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_text_message(event: MessageEvent):
-    user_id = event.source.user_id if event.source else "unknown"
-    text = event.message.text.strip() if isinstance(event.message, TextMessageContent) else ""
+    user_id = event.source.user_id
+    text = event.message.text.strip() if hasattr(event.message, "text") else ""
 
-    # コマンド: リセット
-    if text in ("/reset", "リセット"):
-        reset_session(user_id)
-        reply_text(event.reply_token, "状態をリセットしました。まずは正面の写真を送ってください。")
+    # コマンド風
+    if text in ("使い方", "help", "ヘルプ"):
+        reply_text(event.reply_token,
+                   "正面→側面の順で、全身が映る画像を2枚送ってください。\n"
+                   "15分以内に2枚目を送らない場合はリセットされます。")
+        return
+    if text in ("リセット", "reset"):
+        cleanup_user(user_id)
+        reply_text(event.reply_token, "状態をリセットしました。正面→側面の順でお送りください。")
         return
 
-    # まだ正面が無ければ案内、次に横
-    sess = ensure_session(user_id)
-    if not sess.get("front"):
-        reply_text(event.reply_token, "テキストを受け取りました。まずは【正面】の写真を送ってください。")
-    elif not sess.get("side"):
-        reply_text(event.reply_token, "正面は受け取り済みです。次に【横】の写真を送ってください。")
-    else:
-        reply_text(event.reply_token, "すでに2枚受領済みです。/reset でやり直しできます。")
+    reply_text(event.reply_token, "受け取りました。画像は正面→側面の順で2枚お送りください。")
 
+# -----------------------------
+# イベントハンドラ（画像）
+# -----------------------------
 @handler.add(MessageEvent, message=ImageMessageContent)
 def on_image_message(event: MessageEvent):
-    user_id = event.source.user_id if event.source else "unknown"
-    sess = ensure_session(user_id)
-
-    # 受け取る順序: front → side
-    next_slot = "front" if not sess.get("front") else ("side" if not sess.get("side") else None)
-    if not next_slot:
-        reply_text(event.reply_token, "すでに【正面】【横】の2枚を受領済みです。/reset でやり直しできます。")
-        return
-
-    # 画像をダウンロード
+    user_id = event.source.user_id
     try:
+        # 画像を一時保存
         saved_path = download_line_image_to_temp(event.message.id)
-        sess[next_slot] = saved_path
-        logger.info("Saved %s image for user %s -> %s", next_slot, user_id, saved_path)
     except Exception as e:
-        logger.error("download error: %s", e, exc_info=True)
-        reply_text(event.reply_token, f"画像の取得に失敗しました。もう一度送ってください。（{next_slot}）")
+        logger.error("download error: %s", e)
+        reply_text(event.reply_token, "画像の取得に失敗しました。もう一度お試しください。")
         return
 
-    # 片方しかない場合は次の案内
-    if next_slot == "front":
-        reply_text(event.reply_token, "【正面】を受け取りました。次に【横】の写真を送ってください。")
+    st = user_state.get(user_id)
+    # 既に正面がある→今回を側面として解析へ
+    if st and "front" in st and not is_timeout(float(st.get("ts", 0))):
+        front_path = st["front"]
+        side_path = saved_path
+        # 解析実行
+        result = post_to_analyzer(front_path, side_path)
+        # 片付け
+        try:
+            os.remove(front_path)
+        except Exception:
+            pass
+        try:
+            os.remove(side_path)
+        except Exception:
+            pass
+        user_state.pop(user_id, None)
+
+        if result is None:
+            reply_text(event.reply_token, "診断API呼び出しでエラーが発生しました。時間をおいて再度お試しください。")
+            return
+
+        # 結果整形して返信
+        report = build_report_text(result)
+        reply_text(event.reply_token, report)
         return
 
-    # ここまで来たら front & side が揃った
-    reply_text(event.reply_token, "【横】を受け取りました。解析中です。しばらくお待ちください…")
+    # それ以外（最初の1枚 or タイムアウト）
+    # → 今回を「正面」として保持（厳密な判定はせず順序で運用）
+    user_state[user_id] = {"front": saved_path, "ts": str(time.time())}
+    reply_text(event.reply_token, "正面画像を受け取りました。続けて側面画像を送ってください。")
 
-    front_path = sess.get("front")
-    side_path = sess.get("side")
-
-    try:
-        result = call_analyzer(front_path, side_path)
-        message = format_analysis_result(result)
-        # 解析結果を返信
-        reply_text(event.reply_token, message)
-    except requests.HTTPError as he:
-        logger.error("Analyzer HTTP error: %s / body=%s", he, getattr(he.response, "text", ""))
-        reply_text(event.reply_token, "解析サーバーからエラーが返りました。時間をおいて再試行してください。")
-    except Exception as e:
-        logger.error("Analyzer call error: %s", e, exc_info=True)
-        reply_text(event.reply_token, "解析に失敗しました。お手数ですが、/reset 後に撮影し直してお試しください。")
-    finally:
-        # 解析後はセッションをリセットして次回に備える
-        reset_session(user_id)
-
-# ------------------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------------------
+# -----------------------------
+# エントリポイント
+# -----------------------------
 if __name__ == "__main__":
-    # Render の Web Service は環境変数 PORT を渡してくる
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
