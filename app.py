@@ -208,7 +208,7 @@ def analyze_and_push(user_id: str, front_path: str, side_path: str):
         text = "診断がタイムアウトしました。サーバ負荷の可能性があります。しばらくしてからお試しください。"
     except requests.HTTPError as he:
         log.error(f"analyzer HTTP error: {he}", exc_info=True)
-        text = "診断API呼び出しでエラーが発生しました。（HTTP）\n時間をおいて再度お試しください。」
+        text = "診断API呼び出しでエラーが発生しました。（HTTP）\n時間をおいて再度お試しください。"
     except Exception as e:
         log.error(f"analyzer post error: {e}", exc_info=True)
         text = "診断API呼び出しでエラーが発生しました。（HTTP）\n時間をおいて再度お試しください。"
