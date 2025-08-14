@@ -1,7 +1,5 @@
 Flask==3.0.3
-numpy==1.26.4
-opencv-python-headless==4.10.0.84
-mediapipe==0.10.14
 gunicorn==22.0.0
 requests>=2.31.0
 line-bot-sdk>=3.13.0
+python-dotenv>=1.0.1
