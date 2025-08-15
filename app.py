@@ -1,232 +1,316 @@
 # app.py
+# -------------------------------
+# 役割:
+# - ヘルスチェック: /, /healthz
+# - LINE Webhook:  /callback
+# - ユーザーから「front」「side」を受け、続く画像を2枚そろえたら解析APIに連携
+# ポイント:
+# - 重いライブラリ(cv2, numpy 等)は遅延 import（関数内でだけ import）
+# - 画像バイトは bytes のまま requests.files に渡す（.read() は使わない）
+# - LINE SDK v3 での返信は ReplyMessageRequest を必ず使う
+# -------------------------------
+
 import os
-import io
+import logging
 from typing import Dict, Any, Optional
 
-from flask import Flask, request, abort, jsonify
+from flask import Flask, request, abort
 
-# --- LINE SDK v3 imports ---
-from linebot.v3 import WebhookHandler
+# LINE SDK v3
 from linebot.v3.messaging import (
-    Configuration,
     ApiClient,
+    Configuration,
     MessagingApi,
     MessagingApiBlob,
     ReplyMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import (
+from linebot.v3.webhook import (
+    WebhookHandler,
     MessageEvent,
     TextMessageContent,
     ImageMessageContent,
 )
+from linebot.v3.exceptions import InvalidSignatureError
 
-import requests  # 軽量なので先頭でOK
+# 軽量ライブラリのみ先頭で import。重いのは関数内に閉じる
+import requests
 
-# ====== Flask ======
+# -------------------------------
+# 設定/初期化
+# -------------------------------
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+CHANNEL_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+ANALYZER_URL = os.getenv(
+    "ANALYZER_URL", "https://ai-body-check-analyzer.onrender.com/analyze"
+)
+
+if not CHANNEL_SECRET or not CHANNEL_TOKEN:
+    logger.warning(
+        "LINE の環境変数が未設定です。LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN を設定してください。"
+    )
+
+config = Configuration(access_token=CHANNEL_TOKEN)
+api_client = ApiClient(config)
+msg_api = MessagingApi(api_client)
+blob_api = MessagingApiBlob(api_client)
+handler = WebhookHandler(CHANNEL_SECRET)
+
+# メモリ簡易セッション: { user_id: {"expect": "front"/"side"/None, "front": bytes|None, "side": bytes|None} }
+SESSIONS: Dict[str, Dict[str, Optional[bytes]]] = {}
+
+
+# -------------------------------
+# ヘルスチェック
+# -------------------------------
 @app.get("/")
 def index():
     return "LINE Bot is running. Health: /healthz", 200
+
 
 @app.route("/healthz", methods=["GET", "HEAD"])
 def healthz():
     return "ok", 200
 
 
-# ====== Config ======
-CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-CHANNEL_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-ANALYZER_URL = os.environ.get(
-    "ANALYZER_URL", "https://ai-body-check-analyzer.onrender.com/analyze"
-)
+# -------------------------------
+# ユーティリティ
+# -------------------------------
+def get_user_id(ev: MessageEvent) -> Optional[str]:
+    """送信者の userId を取得（友だち追加済み想定）。"""
+    try:
+        return ev.source.user_id  # type: ignore[attr-defined]
+    except Exception:
+        return None
 
-if not CHANNEL_SECRET or not CHANNEL_TOKEN:
-    app.logger.warning("LINE_CHANNEL_SECRET or LINE_CHANNEL_ACCESS_TOKEN is missing.")
-
-# LINE APIクライアントはリクエスト毎にApiClient()を開くのがv3の基本
-line_config = Configuration(access_token=CHANNEL_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
-
-# ====== 簡易セッション（プロセス内; Renderの再起動で消えます）======
-# userId -> {"expect": Optional["front"|"side"|"both"], "front": Optional[bytes], "side": Optional[bytes]}
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-HELP_TEXT = (
-    "姿勢チェックを始めます。\n"
-    "1) 「front」 と送信 → 正面の姿勢写真を1枚送信\n"
-    "2) 「side」 と送信 → 横の姿勢写真を1枚送信\n"
-    "※ 正面と横の両方を解析したい場合は、まず「front」を送って正面写真、"
-    "続けて「side」を送って横写真を送ってください。両方揃うと自動解析します。"
-)
 
 def reply_text(reply_token: str, text: str) -> None:
-    with ApiClient(line_config) as api_client:
-        msg_api = MessagingApi(api_client)
+    """テキストで返信（v3 は ReplyMessageRequest が必須）。"""
+    try:
         msg_api.reply_message(
             ReplyMessageRequest(
                 replyToken=reply_token,
                 messages=[TextMessage(text=text)],
             )
         )
+    except Exception:
+        logger.exception("reply_text failed")
 
-def get_user_id(ev: MessageEvent) -> Optional[str]:
-    # v3では source がdict化される場合もあるので両対応
-    src = getattr(ev, "source", None)
-    if not src:
-        return None
-    # userId / groupId / roomId いずれか
-    return getattr(src, "userId", None) or getattr(src, "groupId", None) or getattr(src, "roomId", None)
 
 def fetch_image_bytes(message_id: str) -> bytes:
-    with ApiClient(line_config) as api_client:
-        blob_api = MessagingApiBlob(api_client)
-        content = blob_api.get_message_content(message_id)
-        # content.body は bytes（v3）
-        return content.body
-
-def try_call_analyzer(front: Optional[bytes], side: Optional[bytes]) -> Optional[dict]:
     """
-    front/side のいずれか一方でもあれば送る設計にもできるが、
-    ここでは「両方揃ったら送る」挙動にする。
+    LINE の Blob API から画像バイトを取得。
+    SDK 実装差に備えて bytes or ストリームの両対応にしておく。
     """
-    if not front or not side:
-        return None
+    resp = blob_api.get_message_content(message_id)
 
+    # v3 SDK 実装差異対策: bytes or stream どちらも取り出せるように
+    # 1) そのまま bytes の場合
+    if isinstance(resp, (bytes, bytearray)):
+        return bytes(resp)
+
+    # 2) requests.Response 互換のストリーム風オブジェクトの場合
+    body = b""
+    if hasattr(resp, "iter_content"):
+        for chunk in resp.iter_content(chunk_size=1024 * 64):
+            if chunk:
+                body += chunk
+        return body
+
+    # 3) content 属性だけあるケース
+    if hasattr(resp, "content"):
+        return bytes(resp.content)
+
+    # 4) data 属性だけあるケース
+    if hasattr(resp, "data"):
+        return bytes(resp.data)
+
+    # それでもダメなら型エラー
+    raise TypeError(f"unsupported message content type from LINE SDK: {type(resp)}")
+
+
+def try_call_analyzer(front_bytes: bytes, side_bytes: bytes, *, timeout_sec: int = 30) -> Dict[str, Any]:
+    """
+    解析APIに画像を投げる。
+    **bytes に .read() は呼ばない**。requests の files に素の bytes を渡す。
+    """
     files = {
-        "front": ("front.jpg", io.BytesIO(front), "image/jpeg"),
-        "side": ("side.jpg", io.BytesIO(side), "image/jpeg"),
+        "front": ("front.jpg", front_bytes, "image/jpeg"),
+        "side": ("side.jpg", side_bytes, "image/jpeg"),
     }
     try:
-        resp = requests.post(ANALYZER_URL, files=files, timeout=30)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            app.logger.error(f"Analyzer error: {resp.status_code} {resp.text}")
-            return {"error": f"analyzer status {resp.status_code}"}
+        r = requests.post(ANALYZER_URL, files=files, timeout=timeout_sec)
+        r.raise_for_status()
+        return r.json()
+    except requests.Timeout:
+        logger.exception("Analyzer timeout")
+        return {"error": "timeout"}
     except Exception as e:
-        app.logger.exception(e)
+        logger.exception("Analyzer error: %s", e)
         return {"error": str(e)}
 
 
-# ====== LINE Webhook ======
+def ensure_session(user_id: str) -> Dict[str, Optional[bytes]]:
+    if user_id not in SESSIONS:
+        SESSIONS[user_id] = {"expect": None, "front": None, "side": None}
+    return SESSIONS[user_id]
+
+
+def set_expect(user_id: str, expect: Optional[str]) -> None:
+    sess = ensure_session(user_id)
+    sess["expect"] = expect
+
+
+def reset_session(user_id: str) -> None:
+    SESSIONS[user_id] = {"expect": None, "front": None, "side": None}
+
+
+# -------------------------------
+# Webhook 受信口
+# -------------------------------
 @app.post("/callback")
 def callback():
-    # 署名検証
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
-    if not signature:
+    # LINE 署名検証
+    signature = request.headers.get("x-line-signature")
+    if signature is None:
         abort(400, "Missing signature")
 
+    body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
-    except Exception as e:
-        app.logger.exception(e)
-        abort(400)
+    except InvalidSignatureError:
+        logger.warning("Invalid signature.")
+        abort(400, "Invalid signature")
+    except Exception:
+        logger.exception("handler.handle failed")
+        return "NG", 500
 
     return "OK", 200
 
 
-# ====== イベントハンドラ ======
+# -------------------------------
+# イベントハンドラ
+# -------------------------------
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_text_message(ev: MessageEvent):
-    text = (ev.message.text or "").strip().lower()
-    reply_token = ev.reply_token
     user_id = get_user_id(ev) or "unknown"
+    text = (ev.message.text or "").strip().lower()
 
-    # セッション初期化
-    sess = SESSIONS.setdefault(user_id, {"expect": None, "front": None, "side": None})
-
-    if text in ("開始", "start", "はじめ", "はじめる"):
-        SESSIONS[user_id] = {"expect": None, "front": None, "side": None}
-        reply_text(reply_token, HELP_TEXT)
+    if text in ("start", "開始", "start!", "はじめ", "begin"):
+        reset_session(user_id)
+        msg = (
+            "姿勢チェックを開始します。\n"
+            "1) まず「front」と送信 → 正面写真を“写真として”送信\n"
+            "2) 次に「side」と送信 → 横写真を“写真として”送信\n"
+            "両方そろったら自動的に解析します。"
+        )
+        reply_text(ev.reply_token, msg)
         return
 
-    if text == "front":
-        sess["expect"] = "front"
-        reply_text(reply_token, "OK。正面の姿勢写真を1枚送ってください。")
+    if text in ("front", "正面"):
+        set_expect(user_id, "front")
+        reply_text(ev.reply_token, "正面写真を“写真として”送ってください。")
         return
 
-    if text == "side":
-        sess["expect"] = "side"
-        reply_text(reply_token, "OK。横の姿勢写真を1枚送ってください。")
+    if text in ("side", "横"):
+        set_expect(user_id, "side")
+        reply_text(ev.reply_token, "横写真を“写真として”送ってください。")
         return
 
-    # その他はヘルプ
-    reply_text(reply_token, "コマンドが分かりません。\n" + HELP_TEXT)
+    # ヘルプ
+    if text in ("help", "ヘルプ", "使い方"):
+        reply_text(
+            ev.reply_token,
+            "使い方:\n"
+            "・「front」→ 正面の写真を送る\n"
+            "・「side」 → 横の写真を送る\n"
+            "・「開始」  → はじめから案内\n"
+            "写真は“写真として送信”（共有URLは不可）"
+        )
+        return
+
+    # その他テキスト
+    reply_text(
+        ev.reply_token,
+        "「front」または「side」と送ってから、対応する写真を“写真として”送ってください。"
+    )
 
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def on_image_message(ev: MessageEvent):
-    reply_token = ev.reply_token
     user_id = get_user_id(ev) or "unknown"
-    sess = SESSIONS.setdefault(user_id, {"expect": None, "front": None, "side": None})
-
+    sess = ensure_session(user_id)
     expect = sess.get("expect")
+
     if expect not in ("front", "side"):
-        # 指示なしで画像が来た場合
         reply_text(
-            reply_token,
+            ev.reply_token,
             "画像の取得に失敗：送る前に「front」または「side」と送信してください。\n"
-            "・LINEアプリから“直接”画像を送ってください（共有URL不可）"
+            "・LINEアプリから“直接”写真として送ってください（共有URL不可）"
         )
         return
 
-    # 画像bytes取得
+    # 画像取得
     try:
         img_bytes = fetch_image_bytes(ev.message.id)
-    except Exception as e:
-        app.logger.exception(e)
+    except Exception:
+        logger.exception("fetch_image_bytes failed")
         reply_text(
-            reply_token,
-            "画像の取得に失敗：'bytes' object has no attribute 'read' 等のエラー回避済みです。\n"
-            "・LINEアプリから“直接”画像を送ってください（共有URL不可）\n"
-            "・うまくいかない場合は別の画像でも試してください"
+            ev.reply_token,
+            "画像の取得に失敗しました。\n"
+            "・LINEアプリから“直接”写真として送ってください（共有URL不可）\n"
+            "・別の画像でもお試しください"
         )
         return
 
-    # セッションにセット
+    # セッションに格納
     sess[expect] = img_bytes
-    sess["expect"] = None  # 消費
-    app.logger.info(f"Stored {expect} image for user:{user_id}; front={bool(sess['front'])}, side={bool(sess['side'])}")
+    sess["expect"] = None
 
-    # 両方揃ったら解析
+    # 両方そろったら解析へ
     if sess.get("front") and sess.get("side"):
-        reply_text(reply_token, "画像を受け取りました。解析します…（最大30秒）")
-        result = try_call_analyzer(sess["front"], sess["side"])
+        reply_text(ev.reply_token, "画像を受け取りました。解析します…（最大30秒）")
 
+        # 重いライブラリはここで遅延 import（必要なら）
+        # import numpy as np
+        # import cv2
+
+        result = try_call_analyzer(sess["front"], sess["side"])
         if result and not result.get("error"):
-            # 結果を要約して返信
-            try:
-                scores = result.get("scores", {})
-                advice = result.get("advice", [])
-                summary = (
-                    f"解析完了！\n"
-                    f"総合: {scores.get('overall','-')}\n"
-                    f"姿勢: {scores.get('posture','-')}\n"
-                    f"バランス: {scores.get('balance','-')}\n"
-                    f"アドバイス: " + " / ".join(advice[:2])  # 長すぎないように2件
-                )
-                reply_text(reply_token, summary)
-            except Exception:
-                reply_text(reply_token, "解析は完了しましたが、結果の整形に失敗しました。")
+            scores = result.get("scores", {})
+            advice = result.get("advice", [])
+            summary = (
+                "解析完了！\n"
+                f"総合: {scores.get('overall','-')} / "
+                f"姿勢: {scores.get('posture','-')} / "
+                f"バランス: {scores.get('balance','-')}\n"
+            )
+            if advice:
+                summary += "アドバイス: " + " / ".join(advice[:2])
+            reply_text(ev.reply_token, summary)
         else:
             err = result.get("error") if result else "unknown"
-            reply_text(reply_token, f"解析に失敗しました。時間をおいて再試行してください。({err})")
+            reply_text(ev.reply_token, f"解析に失敗しました。時間をおいて再試行してください。（{err}）")
 
-        # 使い切りセッションにしてクリア
-        SESSIONS[user_id] = {"expect": None, "front": None, "side": None}
-    else:
-        # もう片方を促す
-        if not sess.get("front"):
-            reply_text(reply_token, "正面（front）がまだです。先に「front」と送ってから正面写真を送ってください。")
-        elif not sess.get("side"):
-            reply_text(reply_token, "横（side）がまだです。次に「side」と送ってから横写真を送ってください.")
+        # 使い切りにして毎回リセット
+        reset_session(user_id)
+        return
+
+    # まだ片方だけの場合の案内
+    if not sess.get("front"):
+        reply_text(ev.reply_token, "正面（front）がまだです。「front」と送ってから正面写真を送ってください。")
+    elif not sess.get("side"):
+        reply_text(ev.reply_token, "横（side）がまだです。「side」と送ってから横写真を送ってください。")
 
 
-# ====== ローカル開発用エントリ ======
+# -------------------------------
+# ローカル起動
+# -------------------------------
 if __name__ == "__main__":
-    # Render では Procfile/gunicorn が使われます。ローカルのみ run()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # Render では gunicorn で起動する。ローカル開発用に Flask デバッグサーバも許可。
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
