@@ -1,44 +1,53 @@
+# app.py
+# -*- coding: utf-8 -*-
 import os
-import io
 import logging
-from typing import Dict, Literal
+from flask import Flask, request, abort, jsonify
 
-from flask import Flask, request
-
-# LINE v3 SDK（v3.18.1 で確認）
+# ===== LINE SDK v3 =====
+# 署名検証用パーサ
 from linebot.v3.webhook import WebhookParser
-from linebot.v3.exceptions import InvalidSignatureError
+# イベント / メッセージ型
+from linebot.v3.webhooks import (
+    Event,
+    MessageEvent,
+    TextMessageContent,
+    ImageMessageContent,
+)
+# メッセージ送信用
 from linebot.v3.messaging import (
     MessagingApi,
     MessagingApiBlob,
     ReplyMessageRequest,
     TextMessage,
-    ApiException,  # 例外は messaging から
+    Configuration,
 )
+# 例外
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.messaging.exceptions import ApiException  # ← v3 はこっち
+
 import requests
 
-# ====== 基本設定 ======
-app = Flask(__name__)
-app.logger.setLevel(logging.INFO)
+# -----------------------------
+# 環境変数
+# -----------------------------
+CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+ANALYZER_URL = os.environ.get("ANALYZER_URL", "").rstrip("/")
 
-CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-ANALYZER_URL = os.getenv("ANALYZER_URL")  # 例: https://ai-body-check-analyzer.onrender.com/analyze
-
-if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise ValueError("LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN が未設定です。")
+# バリデーション（Render 起動時に落として原因を明確化）
+if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
+    raise RuntimeError("LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET is missing.")
 
 if not ANALYZER_URL:
-    app.logger.warning("ANALYZER_URL が未設定です。/analyze 連携は失敗します。")
+    logging.warning("ANALYZER_URL is not set. /callback の解析連携はエラーになります。")
 
-parser = WebhookParser(CHANNEL_SECRET)
-msg_api = MessagingApi(channel_access_token=CHANNEL_ACCESS_TOKEN)
-blob_api = MessagingApiBlob(channel_access_token=CHANNEL_ACCESS_TOKEN)
+# -----------------------------
+# Flask
+# -----------------------------
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# ユーザーごとの期待ショット(front/side)を保持（メモリ）
-EXPECTING: Dict[str, Literal["front", "side"]] = {}
-
-# ====== ヘルスチェック ======
 @app.get("/")
 def index():
     return "LINE Bot is running. Health: /healthz", 200
@@ -47,150 +56,165 @@ def index():
 def healthz():
     return "ok", 200
 
-# ====== Webhook ======
-@app.post("/callback")
-def callback():
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True) or ""
+# -----------------------------
+# LINE クライアント
+# -----------------------------
+config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+msg_api = MessagingApi(configuration=config)
+blob_api = MessagingApiBlob(configuration=config)
+parser = WebhookParser(channel_secret=CHANNEL_SECRET)
 
-    try:
-        events = parser.parse(body, signature)
-    except InvalidSignatureError:
-        return "invalid signature", 400
-    except Exception as e:
-        app.logger.exception(f"parse error: {e}")
-        return "parse error", 400
+# ユーザーごとの状態（front/side の指示）を簡易に保持（インメモリ）
+USER_STATE: dict[str, str] = {}
 
-    for ev in events:
-        etype = getattr(ev, "type", "")
-        user_id = getattr(getattr(ev, "source", None), "user_id", None)
-        reply_token = getattr(ev, "reply_token", None)
-
-        # テキスト
-        if etype == "message" and getattr(ev, "message", None) and getattr(ev.message, "type", "") == "text":
-            text = (ev.message.text or "").strip().lower()
-            if text in ("開始", "start"):
-                EXPECTING[user_id] = "front"
-                _reply(reply_token, "OK! まず「正面（front）」の写真を送ってください。")
-            elif text in ("front", "正面"):
-                EXPECTING[user_id] = "front"
-                _reply(reply_token, "正面写真を送ってください。")
-            elif text in ("side", "側面", "横"):
-                EXPECTING[user_id] = "side"
-                _reply(reply_token, "側面写真を送ってください。")
-            else:
-                need = EXPECTING.get(user_id)
-                if need:
-                    _reply(reply_token, f"「{need}」の写真を送ってください。front / side も指定できます。")
-                else:
-                    _reply(reply_token, "「開始」と送ると、解析フローを案内します。")
-            continue
-
-        # 画像
-        if etype == "message" and getattr(ev, "message", None) and getattr(ev.message, "type", "") == "image":
-            # 期待ショットを決定
-            need = EXPECTING.get(user_id)
-            if not need:
-                need = "front"  # デフォルトで front から
-                EXPECTING[user_id] = "front"
-
-            try:
-                # 画像バイトを取得（StreamingBody → bytes）
-                stream = blob_api.get_message_content(message_id=ev.message.id)
-                data = io.BytesIO()
-                for chunk in stream.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        data.write(chunk)
-                img_bytes = data.getvalue()
-
-                if not img_bytes:
-                    raise ValueError("empty image bytes")
-
-                # Analyzer へ送信（bytes で渡す：('name', bytes, mime)）
-                if not ANALYZER_URL:
-                    _reply(reply_token, "サーバ設定不足：ANALYZER_URL が未設定です。")
-                    continue
-
-                files = {
-                    need: (f"{need}.jpg", img_bytes, "image/jpeg"),
-                }
-                # もう片方が揃っている場合は state を見て後段で再送…などもできるが
-                # まずは単発解析で返す
-                res = requests.post(ANALYZER_URL, files=files, timeout=60)
-                if res.status_code != 200:
-                    raise RuntimeError(f"analyzer status {res.status_code}: {res.text[:300]}")
-
-                j = {}
-                try:
-                    j = res.json()
-                except Exception:
-                    pass
-
-                # 返却整形
-                msg = _format_analyze_result(j) if j else "解析OK（レスポンスのJSON解釈に失敗しました）"
-                _reply(reply_token, msg)
-
-                # 次の期待ショットを更新
-                EXPECTING[user_id] = "side" if need == "front" else "front"
-
-            except requests.exceptions.ConnectTimeout:
-                _reply(reply_token, "解析サーバへの接続がタイムアウトしました。しばらくして再試行してください。")
-            except requests.exceptions.ReadTimeout:
-                _reply(reply_token, "解析サーバの応答がタイムアウトしました。しばらくして再試行してください。")
-            except ApiException as e:
-                app.logger.exception(f"LINE Blob API error: {e}")
-                _reply(reply_token, "画像の取得に失敗しました。もう一度、写真として直接送ってください。")
-            except Exception as e:
-                app.logger.exception(f"image handling error: {e}")
-                _reply(
-                    reply_token,
-                    "画像の取得に失敗：処理中にエラーが発生しました。\n"
-                    "・LINEから“写真として”直接送信（URL共有は不可）\n"
-                    "・別の画像で再試行もお願いします"
-                )
-            continue
-
-        # その他イベントは無視
-        continue
-
-    return "OK", 200
-
-
-# ====== ユーティリティ ======
-def _reply(reply_token: str, text: str) -> None:
+# -----------------------------
+# ヘルパー
+# -----------------------------
+def reply_text(reply_token: str, text: str) -> None:
+    """テキスト返信（失敗しても落とさない）"""
     try:
         msg_api.reply_message(
             ReplyMessageRequest(
-                reply_token=reply_token,
+                replyToken=reply_token,
                 messages=[TextMessage(text=text)]
             )
         )
     except ApiException as e:
-        app.logger.exception(f"reply error: {e}")
+        app.logger.exception(f"LINE reply error: {e}")
 
-def _format_analyze_result(j: dict) -> str:
-    # Analyzer 側のサンプルJSONに合わせて整形
-    # 例:
-    # {
-    #   "status":"ok","message":"files received",
-    #   "front_metrics":{"shoulder_angle":"178.3°","pelvis_tilt":"179.9°"},
-    #   "side_metrics":{"forward_head":"2.9cm","kyphosis":"軽度"},
-    #   "scores":{"overall":7.3,"posture":6.0,...},
-    #   "advice":[...]
-    # }
-    parts = []
-    s = j.get("scores") or {}
-    fm = j.get("front_metrics") or {}
-    sm = j.get("side_metrics") or {}
-    adv = j.get("advice") or []
+def fetch_image_bytes(message_id: str) -> bytes:
+    """
+    画像バイトを取得（v3: MessagingApiBlob.get_message_content）
+    戻り値は file-like ではなく bytes として扱う
+    """
+    resp = blob_api.get_message_content(message_id)  # HTTPResponse ライク
+    # v3 SDK は resp.data に bytes、またはストリームを返す実装
+    data = getattr(resp, "data", None)
+    if data is None:
+        # data が無い場合は read() を試す（環境差異対策）
+        if hasattr(resp, "read"):
+            data = resp.read()
+        else:
+            # 念のため body や content も確認
+            data = getattr(resp, "content", None) or getattr(resp, "body", None)
+    if isinstance(data, bytes):
+        return data
+    # ストリームなら bytes 化
+    if hasattr(data, "read"):
+        return data.read()
+    # 最後の保険：__iter__ でチャンクを結合
+    if hasattr(resp, "__iter__"):
+        return b"".join(chunk for chunk in resp)
+    raise RuntimeError("could not fetch image bytes from LINE blob API.")
 
-    if s:
-        parts.append(f"総合: {s.get('overall','-')} / 姿勢: {s.get('posture','-')}")
-    if fm:
-        parts.append(f"[正面] 肩角度: {fm.get('shoulder_angle','-')} 骨盤: {fm.get('pelvis_tilt','-')}")
-    if sm:
-        parts.append(f"[側面] ストレートネック: {sm.get('forward_head','-')} 胸椎: {sm.get('kyphosis','-')}")
-    if adv:
-        parts.append("アドバイス:\n- " + "\n- ".join(adv))
+def post_to_analyzer(which: str, img_bytes: bytes) -> dict:
+    """
+    Analyzer へ画像POST。files は ('front' or 'side') の片方だけでもOK
+    """
+    endpoint = f"{ANALYZER_URL}/analyze"
+    files = {
+        which: (f"{which}.jpg", img_bytes, "image/jpeg")
+    }
+    r = requests.post(endpoint, files=files, timeout=60)
+    r.raise_for_status()
+    return r.json()
 
-    return "\n".join(parts) if parts else "解析結果を受け取りました。"
+# -----------------------------
+# Webhook エンドポイント
+# -----------------------------
+@app.post("/callback")
+def callback():
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+
+    # 署名検証
+    try:
+        events = parser.parse(body, signature)
+    except InvalidSignatureError:
+        app.logger.warning("Invalid signature.")
+        return abort(400, "invalid signature")
+
+    for ev in events:  # type: Event
+        try:
+            # メッセージイベントのみ対象
+            if isinstance(ev, MessageEvent):
+                # テキスト
+                if isinstance(ev.message, TextMessageContent):
+                    text = (ev.message.text or "").strip().lower()
+                    uid = ev.source.user_id if hasattr(ev.source, "user_id") else None
+
+                    if text in ("開始", "start", "help", "ヘルプ"):
+                        reply_text(
+                            ev.reply_token,
+                            "使い方：\n1) 『front』 か 『side』 と送信\n2) 続けて該当の姿勢写真を送信\n（共有URLではなく、写真データそのものを送ってください）"
+                        )
+                    elif text in ("front", "side"):
+                        if uid:
+                            USER_STATE[uid] = text
+                        reply_text(ev.reply_token, f"了解しました。{text} 用の写真を送ってください。")
+                    else:
+                        reply_text(
+                            ev.reply_token,
+                            "『front』 または 『side』 と送ってから、続けて対象の写真を送ってください。"
+                        )
+
+                # 画像
+                elif isinstance(ev.message, ImageMessageContent):
+                    uid = ev.source.user_id if hasattr(ev.source, "user_id") else None
+                    which = USER_STATE.get(uid, "front")  # 既定は front
+                    try:
+                        img_bytes = fetch_image_bytes(ev.message.id)
+                    except Exception as e:
+                        app.logger.exception(f"image fetch failed: {e}")
+                        reply_text(
+                            ev.reply_token,
+                            "画像の取得に失敗しました。\n・LINEアプリから“直接”画像を送ってください（共有URL不可）\n・うまくいかない場合は別の画像でも試してください"
+                        )
+                        continue
+
+                    # Analyzer 連携
+                    if not ANALYZER_URL:
+                        reply_text(ev.reply_token, "ANALYZER_URL が未設定のため解析できません。管理者に連絡してください。")
+                        continue
+
+                    try:
+                        res = post_to_analyzer(which, img_bytes)
+                        # ざっくり整形して返信
+                        msg = ["解析完了！"]
+                        if "scores" in res:
+                            s = res["scores"]
+                            msg.append(f"総合: {s.get('overall','-')}, 姿勢: {s.get('posture','-')}, バランス: {s.get('balance','-')}")
+                        tips = res.get("advice") or []
+                        if tips:
+                            msg.append("アドバイス：")
+                            for t in tips[:3]:
+                                msg.append(f"・{t}")
+                        reply_text(ev.reply_token, "\n".join(msg))
+                    except requests.RequestException as e:
+                        app.logger.exception(f"analyzer request failed: {e}")
+                        reply_text(
+                            ev.reply_token,
+                            "解析サーバへの接続に失敗しました。しばらくしてから再度お試しください。"
+                        )
+                    except Exception as e:
+                        app.logger.exception(f"analyzer error: {e}")
+                        reply_text(
+                            ev.reply_token,
+                            "解析中にエラーが発生しました。別の画像でお試しください。"
+                        )
+            # 他イベントは無視
+        except Exception as e:
+            app.logger.exception(f"event handling error: {e}")
+            # 失敗しても 200 で返し、LINE 側の再試行ループを避ける
+            continue
+
+    return "OK", 200
+
+
+# -----------------------------
+# ローカル起動
+# -----------------------------
+if __name__ == "__main__":
+    # Render は gunicorn で起動される想定。ローカル開発用に Flask 起動を用意
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
