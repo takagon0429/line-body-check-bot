@@ -1,8 +1,7 @@
 Flask==3.0.3
-gunicorn==22.0.0
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
 requests==2.32.4
 python-dotenv==1.0.1
 line-bot-sdk==3.18.1
-# 解析で使うなら（/analyze の中だけで import する想定）
-numpy==1.26.4
-opencv-python-headless==4.10.0.84
+gunicorn==22.0.0
