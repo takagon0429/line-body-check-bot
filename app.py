@@ -9,14 +9,13 @@
 # - 画像バイトは bytes のまま requests.files に渡す（.read() は使わない）
 # - LINE SDK v3 での返信は ReplyMessageRequest を必ず使う
 # -------------------------------
-
 import os
 import logging
 from typing import Dict, Any, Optional
 
 from flask import Flask, request, abort
 
-# LINE SDK v3
+# Messaging API クライアント類
 from linebot.v3.messaging import (
     ApiClient,
     Configuration,
@@ -25,7 +24,8 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhook import (
+# ←ここがポイント：webhooks（複数）
+from linebot.v3.webhooks import (
     WebhookHandler,
     MessageEvent,
     TextMessageContent,
@@ -33,8 +33,8 @@ from linebot.v3.webhook import (
 )
 from linebot.v3.exceptions import InvalidSignatureError
 
-# 軽量ライブラリのみ先頭で import。重いのは関数内に閉じる
-import requests
+import requests  # 軽量なので先頭でOK（重いライブラリは遅延import）
+
 
 # -------------------------------
 # 設定/初期化
