@@ -1,106 +1,70 @@
-# app.py
 import os
 from io import BytesIO
 from threading import Thread
+from typing import Dict, Any, List
 
 from flask import Flask, request, abort
-import requests
 from dotenv import load_dotenv
+import requests
 
-# ==== LINE SDK v3 ====
-# v3 では WebhookParser を使ってイベントを取り出す
-from linebot.v3 import WebhookParser
+# ---- LINE v3 SDK ----
+from linebot.v3.webhook import WebhookParser
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
 from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    MessagingApiBlob,
-    ReplyMessageRequest,
-    PushMessageRequest,
-    TextMessage,
-)
-from linebot.v3.webhooks import (
-    MessageEvent,
-    TextMessageContent,
-    ImageMessageContent,
+    Configuration, ApiClient, MessagingApi, MessagingApiBlob,
+    ReplyMessageRequest, PushMessageRequest, TextMessage
 )
 
-# -----------------------
-# .env の読み込み & 環境変数
-# -----------------------
 load_dotenv()
 
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+ANALYZER_URL = os.getenv("ANALYZER_URL", "https://ai-body-check-analyzer.onrender.com/analyze")
 
-# Analyzer のURL（Renderの推奨：POST /analyze、Health: GET /healthz）
-ANALYZER_URL = os.getenv(
-    "ANALYZER_URL",
-    "https://ai-body-check-analyzer.onrender.com/analyze",
-)
+app = Flask(__name__)
 
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    print("[WARN] LINEの環境変数が未設定です。BOT機能は動作しません。")
+    print("[WARN] LINE env not set. Bot features will not work.")
 
-# LINEクライアント（v3の正しい初期化）
+# LINE clients
 config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 api_client = ApiClient(config)
 msg_api = MessagingApi(api_client)
 blob_api = MessagingApiBlob(api_client)
-
-# Webhook署名パーサ
 parser = WebhookParser(CHANNEL_SECRET)
 
-# 状態管理（ユーザーごとに次に期待する画像: "front" or "side"）
-EXPECTING: dict[str, str] = {}
+# 次に期待する画像状態
+EXPECTING: Dict[str, str] = {}
 
-# Flask
-app = Flask(__name__)
-
-
-# -----------------------
-# ヘルスチェック
-# -----------------------
+# ---------- health ----------
 @app.get("/")
 def index():
     return "LINE Bot is running. Health: /healthz", 200
-
 
 @app.route("/healthz", methods=["GET", "HEAD"])
 def healthz():
     return "ok", 200
 
-
-# -----------------------
-# 日本語整形ヘルパー
-# -----------------------
+# ---------- 日本語整形 ----------
 def _fmt_deg(v):
     try:
-        return f"{float(v):.1f}°"
-    except Exception:
+        if isinstance(v, (int, float)):
+            return f"{v:.1f}°"
         s = str(v)
         return s if "°" in s else f"{s}°"
-
+    except Exception:
+        return str(v)
 
 def _fmt_cm(v):
     try:
-        return f"{float(v):.1f}cm"
-    except Exception:
+        if isinstance(v, (int, float)):
+            return f"{v:.1f}cm"
         s = str(v)
         return s if s.endswith("cm") else f"{s}cm"
+    except Exception:
+        return str(v)
 
-
-def format_analyzer_result_jp(result: dict) -> str:
-    """
-    Analyzerの返却JSONを日本語の見出し・単位付きに整形して1本文にする
-    想定入力例：
-      {
-        "scores": {"balance": 7.0, "fashion": 8.0, "muscle_fat": 8.2, "overall": 7.3, "posture": 6.0},
-        "front_metrics": {"pelvis_tilt": 179.9, "shoulder_angle": 178.3},
-        "side_metrics": {"forward_head": 2.9, "kyphosis": "軽度"},
-        "advice": ["...","..."]
-      }
-    """
+def format_analyzer_result_jp(result: Dict[str, Any]) -> str:
     scores = result.get("scores", {}) or {}
     jp_scores = {
         "バランス": scores.get("balance"),
@@ -109,11 +73,12 @@ def format_analyzer_result_jp(result: dict) -> str:
         "全体印象": scores.get("overall"),
         "姿勢": scores.get("posture"),
     }
-    score_lines = []
+    score_lines: List[str] = []
     for k, v in jp_scores.items():
         if v is not None:
             try:
-                score_lines.append(f"- {k}：{float(v):.1f}")
+                v_num = float(v)
+                score_lines.append(f"- {k}：{v_num:.1f}")
             except Exception:
                 score_lines.append(f"- {k}：{v}")
 
@@ -149,114 +114,81 @@ def format_analyzer_result_jp(result: dict) -> str:
         parts.append("【アドバイス】\n" + "\n".join(adv_lines))
 
     if not parts:
-        import json as _json
-        return "解析結果：\n" + _json.dumps(result, ensure_ascii=False, indent=2)
+        return "解析結果の整形に失敗しました。もう一度お試しください。"
 
     return "\n\n".join(parts)
 
-
-# -----------------------
-# Analyzer 呼び出し（短いタイムアウト）
-# -----------------------
-def post_to_analyzer(front_bytes: bytes | None, side_bytes: bytes | None, timeout=(5, 20)) -> dict:
+# ---------- analyzer 呼び出し ----------
+def post_to_analyzer(front_bytes: bytes | None, side_bytes: bytes | None, timeout=(5, 55)) -> Dict[str, Any]:
     files = {}
     if front_bytes:
         files["front"] = ("front.jpg", front_bytes, "image/jpeg")
     if side_bytes:
         files["side"] = ("side.jpg", side_bytes, "image/jpeg")
-
     resp = requests.post(ANALYZER_URL, files=files, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
-
-# -----------------------
-# LINE画像バイト取得（v3 Blob API）
-# -----------------------
 def get_image_bytes(message_id: str) -> bytes:
-    """
-    LINEの画像コンテンツをbytesで返す。
-    SDKの戻りがbytesでもストリームでも吸収して返す。
-    """
+    # v3はbytesが返る実装。将来の変更に備えて念のため両対応
     content = blob_api.get_message_content(message_id)
-
-    # v3 実装は bytes を返すことが多い
     if isinstance(content, (bytes, bytearray)):
         return bytes(content)
-
-    # Response-like の可能性にも対応
     if hasattr(content, "iter_content"):
         buf = BytesIO()
-        for chunk in content.iter_content(chunk_size=1024 * 1024):
+        for chunk in content.iter_content(1024 * 1024):
             if chunk:
                 buf.write(chunk)
         return buf.getvalue()
-
     if hasattr(content, "read"):
         return content.read()
+    raise TypeError(f"Unsupported blob content: {type(content)}")
 
-    raise TypeError(f"Unsupported content type from blob API: {type(content)}")
-
-
-# -----------------------
-# 安全リプライ
-# -----------------------
 def safe_reply(reply_token: str, text: str):
     try:
         msg_api.reply_message(
             ReplyMessageRequest(
                 reply_token=reply_token,
-                messages=[TextMessage(text=text[:5000])],
+                messages=[TextMessage(text=text[:5000])]
             )
         )
     except Exception as e:
         print(f"[WARN] reply failed: {e}")
 
-
-# -----------------------
-# 解析→push（非同期で本番向け）
-# -----------------------
 def analyze_and_push(user_id: str, front_bytes: bytes, side_bytes: bytes):
-    # ウォームアップ（失敗は無視）
+    # cold start対策（hibernation回避）
     try:
         healthz = ANALYZER_URL.replace("/analyze", "/healthz")
         requests.get(healthz, timeout=2)
     except Exception:
         pass
 
+    out_text = "解析に失敗しました。時間をおいて再試行してください。"
     try:
-        result = post_to_analyzer(front_bytes, side_bytes, timeout=(5, 40))
-        reply_text = format_analyzer_result_jp(result)
+        result = post_to_analyzer(front_bytes, side_bytes)
+        out_text = format_analyzer_result_jp(result)
     except requests.Timeout:
-        reply_text = "解析サーバが混み合っています。時間をおいて再試行してください。"
+        out_text = "解析サーバが混み合っています。時間をおいて再試行してください。"
     except requests.RequestException as e:
-        print(f"[ERROR] analyzer request failed: {e}")
-        reply_text = "解析サーバへの送信に失敗しました。時間をおいて再試行してください。"
+        print(f"[ERROR] analyzer request: {e}")
     except Exception as e:
-        print(f"[ERROR] result formatting failed: {e}")
-        reply_text = "解析中にエラーが発生しました。もう一度お試しください。"
+        print(f"[ERROR] formatting: {e}")
 
-    # push送信（Webhook処理をブロックしない）
     try:
         msg_api.push_message(
             PushMessageRequest(
                 to=user_id,
-                messages=[TextMessage(text=reply_text[:5000])],
+                messages=[TextMessage(text=out_text[:5000])]
             )
         )
     except Exception as e:
         print(f"[ERROR] push failed: {e}")
 
-
-# -----------------------
-# Webhook
-# -----------------------
+# ---------- webhook ----------
 @app.post("/callback")
 def callback():
-    # 署名検証
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-
     try:
         events = parser.parse(body, signature)
     except Exception as e:
@@ -273,98 +205,70 @@ def callback():
         # テキスト
         if isinstance(ev.message, TextMessageContent):
             text = (ev.message.text or "").strip().lower()
-
             if text in ("開始", "start", "かいし"):
-                EXPECTING[user_id] = "front"
-                safe_reply(
-                    reply_token,
-                    "姿勢チェックを開始します。\n1) 「front」と入力 → 正面写真を送信\n2) 「side」と入力 → 側面写真を送信\n（結果は解析完了後にお送りします）",
-                )
+                if user_id:
+                    EXPECTING[user_id] = "front"
+                safe_reply(reply_token, "姿勢チェックを始めます。\n「front」と入力して正面写真→続けて「side」と入力して側面写真を送ってください。")
                 continue
-
             if text == "front":
-                EXPECTING[user_id] = "front"
-                safe_reply(reply_token, "正面(front)の画像を送ってください。")
+                if user_id:
+                    EXPECTING[user_id] = "front"
+                safe_reply(reply_token, "正面(front)の写真を送ってください。")
                 continue
-
             if text == "side":
-                EXPECTING[user_id] = "side"
-                safe_reply(reply_token, "側面(side)の画像を送ってください。")
+                if user_id:
+                    EXPECTING[user_id] = "side"
+                safe_reply(reply_token, "側面(side)の写真を送ってください。")
                 continue
-
-            safe_reply(
-                reply_token,
-                "使い方:\n1) 「開始」\n2) 「front」と入力→正面写真\n3) 「side」と入力→側面写真\n解析は完了後にお送りします。",
-            )
+            safe_reply(reply_token, "使い方:\n1) 「開始」\n2) 「front」と入力→正面写真\n3) 「side」と入力→側面写真\n解析完了後に結果をお送りします。")
             continue
 
         # 画像
         if isinstance(ev.message, ImageMessageContent):
             if not user_id:
-                safe_reply(reply_token, "ユーザーIDを取得できませんでした。もう一度お試しください。")
+                safe_reply(reply_token, "ユーザーIDの取得に失敗しました。もう一度お試しください。")
                 continue
-
             expecting = EXPECTING.get(user_id)
             if expecting not in ("front", "side"):
-                safe_reply(
-                    reply_token,
-                    "まず「開始」と入力し、続けて「front」または「side」を入力してから画像を送ってください。",
-                )
+                safe_reply(reply_token, "まず「開始」と入力し、その後「front」または「side」を入力してから画像を送ってください。")
                 continue
 
-            # 画像バイト取得
             try:
                 content_bytes = get_image_bytes(ev.message.id)
             except Exception as e:
-                print(f"[ERROR] get_image_bytes: {e}")
-                safe_reply(
-                    reply_token,
-                    "画像の取得に失敗しました。LINEアプリから“画像として”送信してください（共有URL不可）。",
-                )
+                print(f"[ERROR] blob: {e}")
+                safe_reply(reply_token, "画像の取得に失敗しました。LINEから“画像として”送信してください（共有URL不可）。")
                 continue
 
-            key_front = f"{user_id}:front"
-            key_side = f"{user_id}:side"
+            k_front = f"{user_id}:front"
+            k_side  = f"{user_id}:side"
 
             if expecting == "front":
-                app.config[key_front] = content_bytes
+                app.config[k_front] = content_bytes
                 EXPECTING[user_id] = "side"
-                safe_reply(reply_token, "frontを受け取りました。次に「side」と入力→側面の画像を送ってください。")
+                safe_reply(reply_token, "front を受け取りました。次に「side」と入力→側面の写真を送ってください。")
                 continue
 
             if expecting == "side":
-                app.config[key_side] = content_bytes
-
-                front_bytes = app.config.get(key_front)
-                side_bytes = app.config.get(key_side)
-
+                app.config[k_side] = content_bytes
+                front_bytes = app.config.get(k_front)
+                side_bytes  = app.config.get(k_side)
                 if not front_bytes:
                     EXPECTING[user_id] = "front"
-                    safe_reply(reply_token, "front画像が未取得です。先に「front」と入力→正面画像を送ってください。")
+                    safe_reply(reply_token, "front画像が未取得です。先に「front」と入力→正面写真を送ってください。")
                     continue
 
-                # 即時応答（Webhookは詰まらせない）
                 safe_reply(reply_token, "解析を開始しました。完了次第、結果をお送りします。")
-
-                # バックグラウンドで解析→push
-                Thread(
-                    target=analyze_and_push,
-                    args=(user_id, front_bytes, side_bytes),
-                    daemon=True,
-                ).start()
+                Thread(target=analyze_and_push, args=(user_id, front_bytes, side_bytes), daemon=True).start()
 
                 # 後始末
-                app.config.pop(key_front, None)
-                app.config.pop(key_side, None)
+                app.config.pop(k_front, None)
+                app.config.pop(k_side, None)
                 EXPECTING.pop(user_id, None)
                 continue
 
     return "OK", 200
 
-
-# -----------------------
-# 開発用エントリ
-# -----------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=True)
