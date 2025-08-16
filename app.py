@@ -1,15 +1,14 @@
 # app.py
 import os
-import json
 from io import BytesIO
 from threading import Thread
 
 from flask import Flask, request, abort
-
 import requests
 from dotenv import load_dotenv
 
 # ==== LINE SDK v3 ====
+# v3 では WebhookParser を使ってイベントを取り出す
 from linebot.v3 import WebhookParser
 from linebot.v3.messaging import (
     Configuration,
@@ -27,12 +26,14 @@ from linebot.v3.webhooks import (
 )
 
 # -----------------------
-# 環境変数
+# .env の読み込み & 環境変数
 # -----------------------
 load_dotenv()
 
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+
+# Analyzer のURL（Renderの推奨：POST /analyze、Health: GET /healthz）
 ANALYZER_URL = os.getenv(
     "ANALYZER_URL",
     "https://ai-body-check-analyzer.onrender.com/analyze",
@@ -50,7 +51,7 @@ blob_api = MessagingApiBlob(api_client)
 # Webhook署名パーサ
 parser = WebhookParser(CHANNEL_SECRET)
 
-# 状態管理（期待している次の画像: "front" or "side"）
+# 状態管理（ユーザーごとに次に期待する画像: "front" or "side"）
 EXPECTING: dict[str, str] = {}
 
 # Flask
@@ -71,23 +72,106 @@ def healthz():
 
 
 # -----------------------
-# 解析サーバ呼び出し（短いタイムアウトを明示）
+# 日本語整形ヘルパー
 # -----------------------
-def post_to_analyzer(front_bytes: bytes | None, side_bytes: bytes | None):
+def _fmt_deg(v):
+    try:
+        return f"{float(v):.1f}°"
+    except Exception:
+        s = str(v)
+        return s if "°" in s else f"{s}°"
+
+
+def _fmt_cm(v):
+    try:
+        return f"{float(v):.1f}cm"
+    except Exception:
+        s = str(v)
+        return s if s.endswith("cm") else f"{s}cm"
+
+
+def format_analyzer_result_jp(result: dict) -> str:
+    """
+    Analyzerの返却JSONを日本語の見出し・単位付きに整形して1本文にする
+    想定入力例：
+      {
+        "scores": {"balance": 7.0, "fashion": 8.0, "muscle_fat": 8.2, "overall": 7.3, "posture": 6.0},
+        "front_metrics": {"pelvis_tilt": 179.9, "shoulder_angle": 178.3},
+        "side_metrics": {"forward_head": 2.9, "kyphosis": "軽度"},
+        "advice": ["...","..."]
+      }
+    """
+    scores = result.get("scores", {}) or {}
+    jp_scores = {
+        "バランス": scores.get("balance"),
+        "ファッション映え度": scores.get("fashion"),
+        "筋肉・脂肪のつき方": scores.get("muscle_fat"),
+        "全体印象": scores.get("overall"),
+        "姿勢": scores.get("posture"),
+    }
+    score_lines = []
+    for k, v in jp_scores.items():
+        if v is not None:
+            try:
+                score_lines.append(f"- {k}：{float(v):.1f}")
+            except Exception:
+                score_lines.append(f"- {k}：{v}")
+
+    front = result.get("front_metrics", {}) or {}
+    pelvis = front.get("pelvis_tilt")
+    shoulder = front.get("shoulder_angle")
+    front_lines = []
+    if pelvis is not None:
+        front_lines.append(f"- 骨盤の傾き：{_fmt_deg(pelvis)}")
+    if shoulder is not None:
+        front_lines.append(f"- 肩の角度差：{_fmt_deg(shoulder)}")
+
+    side = result.get("side_metrics", {}) or {}
+    fwd_head = side.get("forward_head")
+    kyphosis = side.get("kyphosis")
+    side_lines = []
+    if fwd_head is not None:
+        side_lines.append(f"- 頭の前方変位：{_fmt_cm(fwd_head)}")
+    if kyphosis is not None:
+        side_lines.append(f"- 背中の丸まり（胸椎後弯）：{kyphosis}")
+
+    adv = result.get("advice", []) or []
+    adv_lines = [f"- {a}" for a in adv if a]
+
+    parts = []
+    if score_lines:
+        parts.append("【スコア】\n" + "\n".join(score_lines))
+    if front_lines:
+        parts.append("【正面評価】\n" + "\n".join(front_lines))
+    if side_lines:
+        parts.append("【側面評価】\n" + "\n".join(side_lines))
+    if adv_lines:
+        parts.append("【アドバイス】\n" + "\n".join(adv_lines))
+
+    if not parts:
+        import json as _json
+        return "解析結果：\n" + _json.dumps(result, ensure_ascii=False, indent=2)
+
+    return "\n\n".join(parts)
+
+
+# -----------------------
+# Analyzer 呼び出し（短いタイムアウト）
+# -----------------------
+def post_to_analyzer(front_bytes: bytes | None, side_bytes: bytes | None, timeout=(5, 20)) -> dict:
     files = {}
     if front_bytes:
         files["front"] = ("front.jpg", front_bytes, "image/jpeg")
     if side_bytes:
         files["side"] = ("side.jpg", side_bytes, "image/jpeg")
 
-    # 接続:5秒 / 応答読み取り:20秒
-    resp = requests.post(ANALYZER_URL, files=files, timeout=(5, 20))
+    resp = requests.post(ANALYZER_URL, files=files, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
 
 # -----------------------
-# 画像バイト取得（v3 Blob API用）
+# LINE画像バイト取得（v3 Blob API）
 # -----------------------
 def get_image_bytes(message_id: str) -> bytes:
     """
@@ -96,11 +180,11 @@ def get_image_bytes(message_id: str) -> bytes:
     """
     content = blob_api.get_message_content(message_id)
 
-    # v3はbytesが返る実装（将来互換のため念のため両対応）
+    # v3 実装は bytes を返すことが多い
     if isinstance(content, (bytes, bytearray)):
         return bytes(content)
 
-    # 一部実装で Response-like を返す可能性に備える
+    # Response-like の可能性にも対応
     if hasattr(content, "iter_content"):
         buf = BytesIO()
         for chunk in content.iter_content(chunk_size=1024 * 1024):
@@ -108,7 +192,6 @@ def get_image_bytes(message_id: str) -> bytes:
                 buf.write(chunk)
         return buf.getvalue()
 
-    # 文字列やその他が来た時のフォールバック
     if hasattr(content, "read"):
         return content.read()
 
@@ -131,10 +214,10 @@ def safe_reply(reply_token: str, text: str):
 
 
 # -----------------------
-# 解析→push（非同期）
+# 解析→push（非同期で本番向け）
 # -----------------------
 def analyze_and_push(user_id: str, front_bytes: bytes, side_bytes: bytes):
-    # ウォームアップ（任意・失敗しても無視）
+    # ウォームアップ（失敗は無視）
     try:
         healthz = ANALYZER_URL.replace("/analyze", "/healthz")
         requests.get(healthz, timeout=2)
@@ -142,48 +225,23 @@ def analyze_and_push(user_id: str, front_bytes: bytes, side_bytes: bytes):
         pass
 
     try:
-        result = post_to_analyzer(front_bytes, side_bytes)
-
-        advice = result.get("advice") or []
-        scores = result.get("scores") or {}
-        front_metrics = result.get("front_metrics") or {}
-        side_metrics = result.get("side_metrics") or {}
-
-        lines: list[str] = []
-        if scores:
-            lines.append("【スコア】")
-            for k, v in scores.items():
-                lines.append(f"- {k}: {v}")
-        if front_metrics:
-            lines.append("\n【正面】")
-            for k, v in front_metrics.items():
-                lines.append(f"- {k}: {v}")
-        if side_metrics:
-            lines.append("\n【側面】")
-            for k, v in side_metrics.items():
-                lines.append(f"- {k}: {v}")
-        if advice:
-            lines.append("\n【アドバイス】")
-            for a in advice:
-                lines.append(f"- {a}")
-
-        out = "\n".join(lines) if lines else "解析が完了しました。"
-
+        result = post_to_analyzer(front_bytes, side_bytes, timeout=(5, 40))
+        reply_text = format_analyzer_result_jp(result)
     except requests.Timeout:
-        out = "解析サーバが混み合っています。時間をおいて再試行してください。"
+        reply_text = "解析サーバが混み合っています。時間をおいて再試行してください。"
     except requests.RequestException as e:
         print(f"[ERROR] analyzer request failed: {e}")
-        out = "解析サーバへの送信に失敗しました。時間をおいて再試行してください。"
+        reply_text = "解析サーバへの送信に失敗しました。時間をおいて再試行してください。"
     except Exception as e:
         print(f"[ERROR] result formatting failed: {e}")
-        out = "解析中にエラーが発生しました。もう一度お試しください。"
+        reply_text = "解析中にエラーが発生しました。もう一度お試しください。"
 
-    # push送信（ここでWebhookを待たせない）
+    # push送信（Webhook処理をブロックしない）
     try:
         msg_api.push_message(
             PushMessageRequest(
                 to=user_id,
-                messages=[TextMessage(text=out[:5000])],
+                messages=[TextMessage(text=reply_text[:5000])],
             )
         )
     except Exception as e:
@@ -220,7 +278,7 @@ def callback():
                 EXPECTING[user_id] = "front"
                 safe_reply(
                     reply_token,
-                    "姿勢チェックを開始します。\nまず「front」と入力してから正面の写真を送ってください。",
+                    "姿勢チェックを開始します。\n1) 「front」と入力 → 正面写真を送信\n2) 「side」と入力 → 側面写真を送信\n（結果は解析完了後にお送りします）",
                 )
                 continue
 
@@ -234,7 +292,6 @@ def callback():
                 safe_reply(reply_token, "側面(side)の画像を送ってください。")
                 continue
 
-            # その他メッセージ
             safe_reply(
                 reply_token,
                 "使い方:\n1) 「開始」\n2) 「front」と入力→正面写真\n3) 「side」と入力→側面写真\n解析は完了後にお送りします。",
@@ -310,4 +367,4 @@ def callback():
 # -----------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
